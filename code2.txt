@@ -1,0 +1,1394 @@
+res://axiom-runtime-/core/contracts/UIContract.gd
+
+## UIContract.gd
+## Directory: /axiom-runtime-/core/contracts/UIContract.gd
+##
+
+## UIContract.gd
+## Phase 6: Game Interfaces - UI contract definitions
+## Directory: /core/contracts/UIContract.gd
+##
+## CRITICAL: Defines UI contract structure
+## UI components can be extended or replaced by mods
+## Core never interprets UI logic or layout
+
+extends RefCounted
+
+const VERSION = "1.0.0"
+
+## UI contract metadata structure
+class UIMetadata:
+	var ui_id: String
+	var replaceable: bool  # Can mods replace this UI?
+	var extensible: bool   # Can mods add to this UI?
+	var description: String
+	var ui_type: String    # "panel", "dialog", "overlay", etc. (opaque to Core)
+	var mount_points: Array[String]  # Named locations for extensions
+	
+	func _init():
+		ui_id = ""
+		replaceable = false
+		extensible = false
+		description = ""
+		ui_type = ""
+		mount_points = []
+	
+	func to_dict() -> Dictionary:
+		return {
+			"ui_id": ui_id,
+			"replaceable": replaceable,
+			"extensible": extensible,
+			"description": description,
+			"ui_type": ui_type,
+			"mount_points": mount_points
+		}
+	
+	static func from_dict(data: Dictionary) -> UIMetadata:
+		var meta = UIMetadata.new()
+		meta.ui_id = data.get("ui_id", "")
+		meta.replaceable = data.get("replaceable", false)
+		meta.extensible = data.get("extensible", false)
+		meta.description = data.get("description", "")
+		meta.ui_type = data.get("ui_type", "")
+		meta.mount_points = data.get("mount_points", [])
+		return meta
+
+
+## UI replacement tracking
+class UIReplacement:
+	var ui_id: String
+	var mod_id: String
+	var scene_path: String
+	var timestamp: int
+	
+	func _init(ui: String, mod: String, path: String):
+		ui_id = ui
+		mod_id = mod
+		scene_path = path
+		timestamp = Time.get_ticks_msec()
+
+
+## UI extension tracking
+class UIExtension:
+	var extension_id: String
+	var ui_id: String
+	var mod_id: String
+	var mount_point: String
+	var scene_path: String
+	var timestamp: int
+	
+	func _init(ext_id: String, ui: String, mod: String, mount: String, path: String):
+		extension_id = ext_id
+		ui_id = ui
+		mod_id = mod
+		mount_point = mount
+		scene_path = path
+		timestamp = Time.get_ticks_msec()
+
+
+## Internal state
+static var _ui_replacements: Dictionary = {}  # {ui_id: UIReplacement}
+static var _ui_extensions: Dictionary = {}    # {extension_id: UIExtension}
+static var _extensions_by_ui: Dictionary = {} # {ui_id: [extension_ids]}
+
+
+## ============================================================================
+## CONTRACT REGISTRATION HELPERS
+## ============================================================================
+
+static func register_ui(coremod_id: String, metadata: UIMetadata) -> bool:
+	"""
+	Register a UI contract with the ContractRegistry.
+	
+	Args:
+		coremod_id: ID of the CoreMod registering this UI
+		metadata: UI metadata
+	
+	Returns:
+		true if registered successfully
+	"""
+	
+	if metadata.ui_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "UIContract", "UI ID cannot be empty")
+		return false
+	
+	# Log UI capabilities
+	var flags = []
+	if metadata.replaceable:
+		flags.append("REPLACEABLE")
+	if metadata.extensible:
+		flags.append("EXTENSIBLE")
+	
+	var flags_str = " [%s]" % ", ".join(flags) if not flags.is_empty() else " [SEALED]"
+	LoggingService.info(LoggingService.Context.CORE, "UIContract", "UI '%s'%s" % [metadata.ui_id, flags_str])
+	
+	if metadata.extensible and not metadata.mount_points.is_empty():
+		LoggingService.info(LoggingService.Context.CORE, "UIContract", "  Mount points: %s" % ", ".join(metadata.mount_points))
+	
+	return ContractRegistry.register_contract(
+		metadata.ui_id,
+		ContractRegistry.ContractType.UI,
+		coremod_id,
+		metadata.to_dict()
+	)
+
+
+static func unregister_ui(ui_id: String) -> bool:
+	"""
+	Unregister a UI contract.
+	"""
+	# Clear any active replacements
+	if _ui_replacements.has(ui_id):
+		_ui_replacements.erase(ui_id)
+	
+	# Clear any extensions
+	if _extensions_by_ui.has(ui_id):
+		for ext_id in _extensions_by_ui[ui_id]:
+			_ui_extensions.erase(ext_id)
+		_extensions_by_ui.erase(ui_id)
+	
+	return ContractRegistry.unregister_contract(ui_id)
+
+
+## ============================================================================
+## UI REPLACEMENT (Mod-facing)
+## ============================================================================
+
+static func replace_ui(ui_id: String, mod_id: String, scene_path: String) -> bool:
+	"""
+	Replace a UI with a mod-provided scene.
+	
+	CRITICAL RULES:
+	- UI must be marked replaceable
+	- Replacement is logged
+	- Only one replacement active at a time
+	
+	Args:
+		ui_id: Contract ID of the UI
+		mod_id: ID of the mod replacing
+		scene_path: Path to replacement scene
+	
+	Returns:
+		true if replacement successful
+	"""
+	
+	# Validate contract exists
+	if not ContractRegistry.has_contract(ui_id):
+		LoggingService.error(LoggingService.Context.CORE, "UIContract", "UI contract not found: %s" % ui_id)
+		return false
+	
+	# Get metadata
+	var meta_dict = ContractRegistry.get_contract_metadata(ui_id)
+	var metadata = UIMetadata.from_dict(meta_dict)
+	
+	# Check if replaceable
+	if not metadata.replaceable:
+		LoggingService.error(LoggingService.Context.CORE, "UIContract", "UI '%s' is NOT replaceable - replacement denied" % ui_id)
+		return false
+	
+	# Check for existing replacement
+	if _ui_replacements.has(ui_id):
+		var existing: UIReplacement = _ui_replacements[ui_id]
+		LoggingService.warn(LoggingService.Context.CORE, "UIContract", "UI '%s' already replaced by mod '%s' - conflict detected" % [ui_id, existing.mod_id])
+	
+	# Register replacement
+	var replacement = UIReplacement.new(ui_id, mod_id, scene_path)
+	_ui_replacements[ui_id] = replacement
+	
+	LoggingService.info(LoggingService.Context.CORE, "UIContract", "UI '%s' replaced by mod '%s'" % [ui_id, mod_id])
+	
+	return true
+
+
+static func remove_replacement(ui_id: String, mod_id: String) -> bool:
+	"""
+	Remove a UI replacement.
+	"""
+	if not _ui_replacements.has(ui_id):
+		return false
+	
+	var replacement: UIReplacement = _ui_replacements[ui_id]
+	if replacement.mod_id != mod_id:
+		LoggingService.warn(LoggingService.Context.CORE, "UIContract", "Cannot remove replacement - mod mismatch")
+		return false
+	
+	_ui_replacements.erase(ui_id)
+	LoggingService.info(LoggingService.Context.CORE, "UIContract", "Removed replacement for UI '%s' by mod '%s'" % [ui_id, mod_id])
+	
+	return true
+
+
+static func remove_all_replacements_for_mod(mod_id: String) -> int:
+	"""
+	Remove all UI replacements by a specific mod.
+	"""
+	var count = 0
+	var to_remove: Array[String] = []
+	
+	for ui_id in _ui_replacements.keys():
+		var replacement: UIReplacement = _ui_replacements[ui_id]
+		if replacement.mod_id == mod_id:
+			to_remove.append(ui_id)
+	
+	for ui_id in to_remove:
+		_ui_replacements.erase(ui_id)
+		count += 1
+	
+	if count > 0:
+		LoggingService.info(LoggingService.Context.CORE, "UIContract", "Removed %d UI replacements for mod '%s'" % [count, mod_id])
+	
+	return count
+
+
+## ============================================================================
+## UI EXTENSION (Mod-facing)
+## ============================================================================
+
+static func extend_ui(ui_id: String, mod_id: String, mount_point: String, scene_path: String) -> String:
+	"""
+	Add an extension to a UI at a mount point.
+	
+	Args:
+		ui_id: Contract ID of the UI
+		mod_id: ID of the mod extending
+		mount_point: Named location to add extension
+		scene_path: Path to extension scene
+	
+	Returns:
+		Extension ID if successful, empty string otherwise
+	"""
+	
+	# Validate contract exists
+	if not ContractRegistry.has_contract(ui_id):
+		LoggingService.error(LoggingService.Context.CORE, "UIContract", "UI contract not found: %s" % ui_id)
+		return ""
+	
+	# Get metadata
+	var meta_dict = ContractRegistry.get_contract_metadata(ui_id)
+	var metadata = UIMetadata.from_dict(meta_dict)
+	
+	# Check if extensible
+	if not metadata.extensible:
+		LoggingService.error(LoggingService.Context.CORE, "UIContract", "UI '%s' is NOT extensible - extension denied" % ui_id)
+		return ""
+	
+	# Validate mount point
+	if not mount_point in metadata.mount_points:
+		LoggingService.error(LoggingService.Context.CORE, "UIContract", "Invalid mount point '%s' for UI '%s'" % [mount_point, ui_id])
+		return ""
+	
+	# Generate extension ID
+	var extension_id = "%s_%s_%s_%d" % [ui_id, mount_point, mod_id, Time.get_ticks_msec()]
+	
+	# Register extension
+	var extension = UIExtension.new(extension_id, ui_id, mod_id, mount_point, scene_path)
+	_ui_extensions[extension_id] = extension
+	
+	if not _extensions_by_ui.has(ui_id):
+		_extensions_by_ui[ui_id] = []
+	_extensions_by_ui[ui_id].append(extension_id)
+	
+	LoggingService.info(LoggingService.Context.CORE, "UIContract", "UI '%s' extended by mod '%s' at mount point '%s'" % [ui_id, mod_id, mount_point])
+	
+	return extension_id
+
+
+static func remove_extension(extension_id: String) -> bool:
+	"""
+	Remove a UI extension.
+	"""
+	if not _ui_extensions.has(extension_id):
+		return false
+	
+	var extension: UIExtension = _ui_extensions[extension_id]
+	var ui_id = extension.ui_id
+	
+	_ui_extensions.erase(extension_id)
+	
+	if _extensions_by_ui.has(ui_id):
+		_extensions_by_ui[ui_id].erase(extension_id)
+	
+	LoggingService.info(LoggingService.Context.CORE, "UIContract", "Removed extension: %s" % extension_id)
+	
+	return true
+
+
+static func remove_all_extensions_for_mod(mod_id: String) -> int:
+	"""
+	Remove all UI extensions by a specific mod.
+	"""
+	var count = 0
+	var to_remove: Array[String] = []
+	
+	for ext_id in _ui_extensions.keys():
+		var extension: UIExtension = _ui_extensions[ext_id]
+		if extension.mod_id == mod_id:
+			to_remove.append(ext_id)
+	
+	for ext_id in to_remove:
+		remove_extension(ext_id)
+		count += 1
+	
+	if count > 0:
+		LoggingService.info(LoggingService.Context.CORE, "UIContract", "Removed %d UI extensions for mod '%s'" % [count, mod_id])
+	
+	return count
+
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+static func is_ui_replaceable(ui_id: String) -> bool:
+	"""
+	Check if a UI can be replaced.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(ui_id)
+	if meta_dict.is_empty():
+		return false
+	return meta_dict.get("replaceable", false)
+
+
+static func is_ui_extensible(ui_id: String) -> bool:
+	"""
+	Check if a UI can be extended.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(ui_id)
+	if meta_dict.is_empty():
+		return false
+	return meta_dict.get("extensible", false)
+
+
+static func get_ui_mount_points(ui_id: String) -> Array[String]:
+	"""
+	Get available mount points for UI extension.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(ui_id)
+	if meta_dict.is_empty():
+		return []
+	return meta_dict.get("mount_points", [])
+
+
+static func is_ui_replaced(ui_id: String) -> bool:
+	"""
+	Check if a UI is currently replaced.
+	"""
+	return _ui_replacements.has(ui_id)
+
+
+static func get_ui_replacement(ui_id: String) -> Dictionary:
+	"""
+	Get replacement info for a UI.
+	Returns: {mod_id: String, scene_path: String} or empty dict
+	"""
+	if not _ui_replacements.has(ui_id):
+		return {}
+	
+	var replacement: UIReplacement = _ui_replacements[ui_id]
+	return {
+		"mod_id": replacement.mod_id,
+		"scene_path": replacement.scene_path
+	}
+
+
+static func get_ui_extensions(ui_id: String) -> Array[Dictionary]:
+	"""
+	Get all extensions for a UI.
+	Returns: [{extension_id, mod_id, mount_point, scene_path}, ...]
+	"""
+	var extensions: Array[Dictionary] = []
+	
+	if not _extensions_by_ui.has(ui_id):
+		return extensions
+	
+	for ext_id in _extensions_by_ui[ui_id]:
+		if _ui_extensions.has(ext_id):
+			var ext: UIExtension = _ui_extensions[ext_id]
+			extensions.append({
+				"extension_id": ext.extension_id,
+				"mod_id": ext.mod_id,
+				"mount_point": ext.mount_point,
+				"scene_path": ext.scene_path
+			})
+	
+	return extensions
+
+
+static func get_extensions_at_mount_point(ui_id: String, mount_point: String) -> Array[Dictionary]:
+	"""
+	Get all extensions at a specific mount point.
+	"""
+	var extensions: Array[Dictionary] = []
+	var all_extensions = get_ui_extensions(ui_id)
+	
+	for ext in all_extensions:
+		if ext["mount_point"] == mount_point:
+			extensions.append(ext)
+	
+	return extensions
+
+
+## ============================================================================
+## VALIDATION
+## ============================================================================
+
+static func validate_ui_contract(ui_id: String) -> bool:
+	"""
+	Validate that a UI contract is properly registered.
+	"""
+	return ContractRegistry.validate_contract_reference(ui_id, ContractRegistry.ContractType.UI)
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+static func get_version() -> String:
+	return VERSION
+
+
+static func get_all_uis() -> Array[String]:
+	"""
+	Get all registered UI contracts.
+	"""
+	return ContractRegistry.get_contracts_by_type(ContractRegistry.ContractType.UI)
+
+
+static func get_uis_for_coremod(coremod_id: String) -> Array[String]:
+	"""
+	Get all UI contracts for a specific CoreMod.
+	"""
+	return ContractRegistry.get_contracts_by_type_for_coremod(ContractRegistry.ContractType.UI, coremod_id)
+
+
+static func get_replaceable_uis() -> Array[String]:
+	"""
+	Get all UIs that can be replaced.
+	"""
+	var replaceable: Array[String] = []
+	var all_uis = get_all_uis()
+	
+	for ui_id in all_uis:
+		if is_ui_replaceable(ui_id):
+			replaceable.append(ui_id)
+	
+	return replaceable
+
+
+static func get_extensible_uis() -> Array[String]:
+	"""
+	Get all UIs that can be extended.
+	"""
+	var extensible: Array[String] = []
+	var all_uis = get_all_uis()
+	
+	for ui_id in all_uis:
+		if is_ui_extensible(ui_id):
+			extensible.append(ui_id)
+	
+	return extensible
+
+
+static func get_active_replacements() -> Dictionary:
+	"""
+	Get all active UI replacements.
+	Returns: {ui_id: mod_id}
+	"""
+	var replacements: Dictionary = {}
+	
+	for ui_id in _ui_replacements.keys():
+		var replacement: UIReplacement = _ui_replacements[ui_id]
+		replacements[ui_id] = replacement.mod_id
+	
+	return replacements
+
+
+static func get_statistics() -> Dictionary:
+	"""
+	Get UI contract statistics.
+	"""
+	return {
+		"total_uis": get_all_uis().size(),
+		"replaceable_uis": get_replaceable_uis().size(),
+		"extensible_uis": get_extensible_uis().size(),
+		"active_replacements": _ui_replacements.size(),
+		"active_extensions": _ui_extensions.size()
+	}
+
+
+res://axiom-runtime-/core/contracts/UIContract.gd.uid
+
+## UIContract.gd.uid
+## Directory: /axiom-runtime-/core/contracts/UIContract.gd.uid
+##
+
+uid://1d0pws6stpxy
+
+
+res://axiom-runtime-/core/logging/LoggingService.gd
+
+## LoggingService.gd
+## Directory: /axiom-runtime-/core/logging/LoggingService.gd
+##
+
+## LoggingService.gd
+## Phase 1: Foundation - Immutable logging system for Axiom Runtime
+## Directory: /core/logging/LoggingService.gd
+##
+## CRITICAL: This must initialize BEFORE any other system
+## Routes logs to Core or CoreMod contexts without semantic validation
+## FIXED: Explicit state management with SAF authorization gate
+##
+## ⚠️ THIS IS PART 1 OF 2 - COPY BOTH PARTS INTO THE SAME FILE
+##
+## STATE FLOW:
+## BOOTSTRAP (RAM-only) → FALLBACK (app storage) OR AUTHORIZED (SAF/primary)
+## READ_ONLY if both fail
+
+extends Node
+
+const VERSION = "2.2.0"
+
+## Logging levels
+enum Level {
+	VERBOSE = 0,
+	DEBUG = 1,
+	INFO = 2,
+	WARN = 3,
+	ERROR = 4,
+	FATAL = 5
+}
+
+## Logging contexts - distinguishes origin, not trust
+enum Context {
+	CORE,        # Runtime/engine logs
+	COREMOD      # CoreMod + its mods
+}
+
+## Logging states - explicit authorization flow
+enum LoggingState {
+	BOOTSTRAP,      # RAM-only buffer before any persistent writes
+	FALLBACK,       # App-specific storage (no SAF needed)
+	AUTHORIZED,     # SAF-approved or primary path
+	READ_ONLY       # Hard failure - cannot write anywhere
+}
+
+## Internal state
+var _current_state: LoggingState = LoggingState.BOOTSTRAP
+var _is_initialized: bool = false
+var _core_log_file: String = ""
+var _coremod_logs: Dictionary = {}  # {coremod_id: log_path}
+var _is_primary_path: bool = false
+var _saf_folder_selected: bool = false
+var _min_log_level: Level = Level.VERBOSE
+
+## Bootstrap buffer - RAM-only logs before persistent storage
+var _bootstrap_buffer: Array[String] = []
+const MAX_BOOTSTRAP_BUFFER_SIZE: int = 1000
+
+## Statistics
+var _total_logs_written: int = 0
+var _total_bytes_written: int = 0
+var _start_time: int = 0
+var _logs_dropped: int = 0
+
+## Profiling
+var _active_profiles: Dictionary = {}
+var _next_profile_id: int = 1
+
+## Log rotation
+const MAX_LOG_INDEX: int = 10
+const CURRENT_MARKER: String = "_current"
+const ROTATION_TRACKER: String = ".log_rotation_index"
+
+## Path structure
+const PRIMARY_BASE: String = "/storage/emulated/0/AxiomRuntime"
+const FALLBACK_BASE: String = "/storage/emulated/0/Android/data/com.axiom.runtime/AxiomRuntime"
+
+## Directory creation lock
+var _dir_creation_lock: Mutex = Mutex.new()
+var _created_dirs: Dictionary = {}
+
+
+## ============================================================================
+## INITIALIZATION - MUST BE CALLED FIRST
+## ============================================================================
+
+func _ready() -> void:
+	if _is_initialized:
+		return
+	
+	_start_time = Time.get_ticks_msec()
+	_current_state = LoggingState.BOOTSTRAP
+	
+	# Log to RAM buffer only
+	_log_to_buffer("═══════════════════════════════════════════════════════")
+	_log_to_buffer("   AXIOM RUNTIME - Mod-First Game Platform")
+	_log_to_buffer("   LoggingService v%s" % VERSION)
+	_log_to_buffer("═══════════════════════════════════════════════════════")
+	_log_to_buffer("STATE: BOOTSTRAP (RAM-only buffer)")
+	_log_to_buffer("Waiting for storage authorization...")
+	_log_to_buffer("")
+	
+	_is_initialized = true
+	
+	# Attempt immediate transition to fallback or primary
+	_attempt_storage_transition()
+
+
+func _attempt_storage_transition() -> void:
+	"""
+	Attempt to transition from BOOTSTRAP to a persistent storage state.
+	This respects the authorization hierarchy:
+	1. Try PRIMARY (if SAF authorized or no authorization needed)
+	2. Fall back to FALLBACK (app-specific storage)
+	3. Stay READ_ONLY if both fail
+	"""
+	
+	_log_to_buffer("Attempting storage transition from BOOTSTRAP...")
+	
+	# Try primary path first (requires SAF on Android with scoped storage)
+	if OS.get_name() != "Android":
+		# Non-Android: primary path always available
+		if _try_enable_primary_path():
+			_transition_to_state(LoggingState.AUTHORIZED)
+			return
+	
+	# Android: check if SAF already granted
+	# (This will be hooked to PermissionManager in integration)
+	var saf_available = false  # Will be: PermissionManager.has_storage_permission()
+	
+	if saf_available:
+		if _try_enable_primary_path():
+			_transition_to_state(LoggingState.AUTHORIZED)
+			return
+	
+	# Fall back to app-specific storage
+	_log_to_buffer("PRIMARY path unavailable, attempting FALLBACK...")
+	if _try_enable_fallback_path():
+		_transition_to_state(LoggingState.FALLBACK)
+		return
+	
+	# Hard failure - cannot write anywhere
+	_transition_to_state(LoggingState.READ_ONLY)
+	push_error("FATAL: LoggingService cannot write to any storage location")
+
+
+func _try_enable_primary_path() -> bool:
+	"""
+	Attempt to enable PRIMARY path.
+	Returns true if successful.
+	"""
+	
+	var base_path = PRIMARY_BASE
+	var core_log_dir = base_path + "/Core/files/logs"
+	
+	if not _ensure_directory_exists(core_log_dir):
+		_log_to_buffer("✗ Cannot create PRIMARY directory: %s" % core_log_dir)
+		return false
+	
+	# Test write capability
+	var test_file = core_log_dir + "/.write_test"
+	var file = FileAccess.open(test_file, FileAccess.WRITE)
+	if not file:
+		_log_to_buffer("✗ Cannot write to PRIMARY path")
+		return false
+	
+	file.store_string("Axiom Runtime write test")
+	file.close()
+	DirAccess.remove_absolute(test_file)
+	
+	# Success - configure primary path
+	_core_log_file = _get_next_log_file(core_log_dir)
+	_is_primary_path = true
+	
+	_log_to_buffer("✓ PRIMARY path enabled: %s" % _core_log_file)
+	return true
+
+
+func _try_enable_fallback_path() -> bool:
+	"""
+	Attempt to enable FALLBACK path (app-specific storage).
+	Returns true if successful.
+	"""
+	
+	var base_path = FALLBACK_BASE
+	var core_log_dir = base_path + "/Core/files/logs"
+	
+	if not _ensure_directory_exists(core_log_dir):
+		_log_to_buffer("✗ Cannot create FALLBACK directory: %s" % core_log_dir)
+		return false
+	
+	# Test write capability
+	var test_file = core_log_dir + "/.write_test"
+	var file = FileAccess.open(test_file, FileAccess.WRITE)
+	if not file:
+		_log_to_buffer("✗ Cannot write to FALLBACK path")
+		return false
+	
+	file.store_string("Axiom Runtime write test")
+	file.close()
+	DirAccess.remove_absolute(test_file)
+	
+	# Success - configure fallback path
+	_core_log_file = _get_next_log_file(core_log_dir)
+	_is_primary_path = false
+	
+	_log_to_buffer("✓ FALLBACK path enabled: %s" % _core_log_file)
+	return true
+
+
+func _transition_to_state(new_state: LoggingState) -> void:
+	"""
+	Transition to a new logging state and flush bootstrap buffer if applicable.
+	"""
+	
+	var old_state = _current_state
+	_current_state = new_state
+	
+	_log_to_buffer("STATE TRANSITION: %s → %s" % [
+		LoggingState.keys()[old_state],
+		LoggingState.keys()[new_state]
+	])
+	
+	match new_state:
+		LoggingState.AUTHORIZED:
+			_log_to_buffer("✓ Logging AUTHORIZED - using PRIMARY path")
+			_flush_bootstrap_buffer()
+		
+		LoggingState.FALLBACK:
+			_log_to_buffer("⚠ Logging in FALLBACK mode - using app-specific storage")
+			_log_to_buffer("Consider granting storage access for PRIMARY path")
+			_flush_bootstrap_buffer()
+		
+		LoggingState.READ_ONLY:
+			push_error("✗ Logging in READ_ONLY mode - cannot persist logs")
+			_log_to_buffer("✗ CRITICAL: Cannot write to any storage location")
+			_log_to_buffer("All logs will be dropped after bootstrap buffer fills")
+			# Bootstrap buffer remains in RAM but won't be flushed
+
+
+func _log_to_buffer(message: String) -> void:
+	"""
+	Write to bootstrap buffer. Used before persistent storage is available.
+	"""
+	
+	if _bootstrap_buffer.size() >= MAX_BOOTSTRAP_BUFFER_SIZE:
+		_logs_dropped += 1
+		return
+	
+	var timestamp = Time.get_datetime_string_from_system()
+	var line = "[%s] [BOOTSTRAP] %s" % [timestamp, message]
+	_bootstrap_buffer.append(line)
+	
+	# Also print to console for debugging
+	print(line)
+
+
+func _flush_bootstrap_buffer() -> void:
+	"""
+	Flush bootstrap buffer to persistent storage.
+	Called after transitioning to FALLBACK or AUTHORIZED state.
+	"""
+	
+	if _bootstrap_buffer.is_empty():
+		return
+	
+	if _core_log_file == "":
+		push_error("Cannot flush bootstrap buffer - no log file configured")
+		return
+	
+	info(Context.CORE, "Bootstrap", "Flushing %d bootstrap entries to persistent storage..." % _bootstrap_buffer.size())
+	
+	# Write all buffered entries
+	for line in _bootstrap_buffer:
+		_write_to_file(_core_log_file, line + "\n")
+	
+	# Clear buffer
+	var flushed_count = _bootstrap_buffer.size()
+	_bootstrap_buffer.clear()
+	
+	info(Context.CORE, "Bootstrap", "✓ Flushed %d entries to: %s" % [flushed_count, _core_log_file.get_file()])
+	
+	if _logs_dropped > 0:
+		warn(Context.CORE, "Bootstrap", "⚠ %d logs were dropped due to buffer overflow" % _logs_dropped)
+
+
+## ============================================================================
+## SAF INTEGRATION (Android Storage Access Framework)
+## ============================================================================
+
+func request_saf_authorization() -> void:
+	"""
+	Request SAF folder selection from user.
+	Called by PermissionManager when storage access is needed.
+	"""
+	
+	if OS.get_name() != "Android":
+		info(Context.CORE, "SAF", "SAF not needed on non-Android platforms")
+		return
+	
+	if _current_state == LoggingState.AUTHORIZED:
+		info(Context.CORE, "SAF", "Already authorized - no action needed")
+		return
+	
+	info(Context.CORE, "SAF", "Requesting SAF folder authorization from user...")
+	# TODO: Phase 2 - Implement JNI bridge for SAF
+	# This will trigger Android folder picker
+
+
+func on_saf_authorized(saf_path: String) -> void:
+	"""
+	Called by PermissionManager when SAF authorization is granted.
+	Transitions from FALLBACK → AUTHORIZED if currently in fallback.
+	"""
+	
+	info(Context.CORE, "SAF", "SAF authorization granted: %s" % saf_path)
+	
+	if _current_state == LoggingState.READ_ONLY:
+		error(Context.CORE, "SAF", "Cannot transition from READ_ONLY state")
+		return
+	
+	# Attempt to switch to primary path
+	if switch_to_primary_path(saf_path):
+		_current_state = LoggingState.AUTHORIZED
+		info(Context.CORE, "SAF", "✓ Transitioned to AUTHORIZED state")
+	else:
+		error(Context.CORE, "SAF", "✗ Failed to switch to primary path despite SAF authorization")
+
+
+func switch_to_primary_path(saf_granted_path: String = "") -> bool:
+	"""
+	Switch from FALLBACK to PRIMARY path.
+	Can only be called in FALLBACK or AUTHORIZED state.
+	"""
+	
+	if _current_state == LoggingState.BOOTSTRAP:
+		warn(Context.CORE, "PathSwitch", "Cannot switch paths during BOOTSTRAP")
+		return false
+	
+	if _current_state == LoggingState.READ_ONLY:
+		warn(Context.CORE, "PathSwitch", "Cannot switch paths in READ_ONLY mode")
+		return false
+	
+	if _is_primary_path:
+		info(Context.CORE, "PathSwitch", "Already using primary path")
+		return true
+	
+	info(Context.CORE, "PathSwitch", "Attempting to switch to PRIMARY path...")
+	
+	var target_base = PRIMARY_BASE if saf_granted_path == "" else saf_granted_path
+	var core_log_dir = target_base + "/Core/files/logs"
+	
+	if not _ensure_directory_exists(core_log_dir):
+		error(Context.CORE, "PathSwitch", "Failed to create PRIMARY directory structure")
+		return false
+	
+	# Test write capability
+	var test_file = core_log_dir + "/.write_test"
+	var file = FileAccess.open(test_file, FileAccess.WRITE)
+	if not file:
+		error(Context.CORE, "PathSwitch", "Cannot write to PRIMARY path")
+		return false
+	
+	file.store_string("Axiom Runtime test file")
+	file.close()
+	DirAccess.remove_absolute(test_file)
+	
+	# Copy current Core log content to new location
+	var old_file = _core_log_file
+	_core_log_file = _get_next_log_file(core_log_dir)
+	
+	var old_content = _read_file(old_file)
+	if old_content != "":
+		_write_to_file(_core_log_file, old_content)
+	
+	_is_primary_path = true
+	
+	info(Context.CORE, "PathSwitch", "✓ Switched to PRIMARY path: %s" % _core_log_file)
+	
+	# Migrate any existing CoreMod logs
+	_migrate_coremod_logs(target_base)
+	
+	return true
+
+
+func _migrate_coremod_logs(new_base: String) -> void:
+	if _coremod_logs.is_empty():
+		return
+	
+	info(Context.CORE, "PathSwitch", "Migrating %d CoreMod logs..." % _coremod_logs.size())
+	
+	for coremod_id in _coremod_logs.keys():
+		var old_path = _coremod_logs[coremod_id]
+		var new_log_dir = new_base + "/CoreMod/" + coremod_id + "/files/logs"
+		
+		if _ensure_directory_exists(new_log_dir):
+			var new_path = _get_next_log_file(new_log_dir)
+			var old_content = _read_file(old_path)
+			
+			if old_content != "":
+				_write_to_file(new_path, old_content)
+			
+			_coremod_logs[coremod_id] = new_path
+			info(Context.CORE, "PathSwitch", "✓ Migrated %s log" % coremod_id)
+
+
+## ============================================================================
+## COREMOD LOG REGISTRATION
+## ============================================================================
+
+func register_coremod_log(coremod_id: String) -> String:
+	if _current_state == LoggingState.BOOTSTRAP:
+		error(Context.CORE, "LogRegistry", "Cannot register CoreMod logs during BOOTSTRAP")
+		return ""
+	
+	if _current_state == LoggingState.READ_ONLY:
+		error(Context.CORE, "LogRegistry", "Cannot register CoreMod logs in READ_ONLY mode")
+		return ""
+	
+	if _coremod_logs.has(coremod_id):
+		warn(Context.CORE, "LogRegistry", "CoreMod '%s' already registered" % coremod_id)
+		return _coremod_logs[coremod_id]
+	
+	var base_path = PRIMARY_BASE if _is_primary_path else FALLBACK_BASE
+	var log_dir = base_path + "/CoreMod/" + coremod_id + "/files/logs"
+	
+	if not _ensure_directory_exists(log_dir):
+		error(Context.CORE, "LogRegistry", "Failed to create log directory for CoreMod: %s" % coremod_id)
+		return ""
+	
+	var log_file = _get_next_log_file(log_dir)
+	_coremod_logs[coremod_id] = log_file
+	
+	info(Context.CORE, "LogRegistry", "✓ Registered CoreMod log: %s → %s" % [coremod_id, log_file])
+	
+	# Write initialization banner to CoreMod log
+	_write_to_file(log_file, "[%s] INFO    [CoreMod] CoreMod '%s' log initialized\n" % [
+		Time.get_datetime_string_from_system(),
+		coremod_id
+	])
+	
+	return log_file
+
+
+func unregister_coremod_log(coremod_id: String) -> void:
+	if not _coremod_logs.has(coremod_id):
+		return
+	
+	info(Context.CORE, "LogRegistry", "Unregistering CoreMod log: %s" % coremod_id)
+	_coremod_logs.erase(coremod_id)
+
+
+## ============================================================================
+## CONTINUE TO PART 2 FOR REST OF IMPLEMENTATION
+## ============================================================================## ⚠️ THIS IS PART 2 OF 2 - APPEND THIS TO PART 1
+## DO NOT INCLUDE THE "extends Node" LINE - THIS CONTINUES FROM PART 1
+
+## ============================================================================
+## DIRECTORY MANAGEMENT (Thread-safe, lazy creation)
+## ============================================================================
+
+func _ensure_directory_exists(path: String) -> bool:
+	_dir_creation_lock.lock()
+	
+	# Check cache first
+	if _created_dirs.has(path):
+		_dir_creation_lock.unlock()
+		return true
+	
+	# Try to create directory structure
+	var dir = DirAccess.open("/")
+	if not dir:
+		_dir_creation_lock.unlock()
+		return false
+	
+	var err = dir.make_dir_recursive(path)
+	var success = (err == OK or DirAccess.dir_exists_absolute(path))
+	
+	if success:
+		_created_dirs[path] = true
+	
+	_dir_creation_lock.unlock()
+	return success
+
+
+## ============================================================================
+## LOG ROTATION SYSTEM
+## ============================================================================
+
+func _get_next_log_file(log_dir: String) -> String:
+	var tracker_file = log_dir + "/" + ROTATION_TRACKER
+	var saved_index = _get_last_rotation_index(tracker_file)
+	var current_count = _count_all_log_files(log_dir)
+	
+	# Detect corruption
+	if saved_index >= 0 and current_count < (MAX_LOG_INDEX + 1):
+		_cleanup_rotation_system(log_dir)
+	
+	# Remove old current markers
+	_remove_all_current_markers(log_dir)
+	
+	# Calculate next index
+	var next_index = _calculate_next_index(log_dir, saved_index, current_count)
+	
+	# Determine if marker needed
+	var needs_marker = (current_count == MAX_LOG_INDEX + 1) or (saved_index >= 0)
+	
+	# Handle rotation
+	if saved_index >= 0 and current_count == MAX_LOG_INDEX + 1:
+		_delete_log_at_index(log_dir, next_index)
+	
+	# Save tracker
+	_save_last_rotation_index(tracker_file, next_index)
+	
+	return _get_log_filename(log_dir, next_index, needs_marker)
+
+
+func _count_all_log_files(log_dir: String) -> int:
+	var count = 0
+	
+	if FileAccess.file_exists(log_dir + "/log.txt") or FileAccess.file_exists(log_dir + "/log%s.txt" % CURRENT_MARKER):
+		count += 1
+	
+	for i in range(1, MAX_LOG_INDEX + 1):
+		if FileAccess.file_exists(log_dir + "/log%d.txt" % i) or FileAccess.file_exists(log_dir + "/log%d%s.txt" % [i, CURRENT_MARKER]):
+			count += 1
+	
+	return count
+
+
+func _calculate_next_index(log_dir: String, saved_index: int, total_count: int) -> int:
+	var existing_indices = {}
+	
+	if FileAccess.file_exists(log_dir + "/log.txt"):
+		existing_indices[0] = true
+	
+	for i in range(1, MAX_LOG_INDEX + 1):
+		if FileAccess.file_exists(log_dir + "/log%d.txt" % i):
+			existing_indices[i] = true
+	
+	# If all slots filled and tracker exists, rotate
+	if saved_index >= 0 and total_count == MAX_LOG_INDEX + 1:
+		return (saved_index + 1) % (MAX_LOG_INDEX + 1)
+	
+	# Find first missing slot
+	for i in range(0, MAX_LOG_INDEX + 1):
+		if not existing_indices.has(i):
+			return i
+	
+	return 0
+
+
+func _remove_all_current_markers(log_dir: String) -> void:
+	var dir = DirAccess.open(log_dir)
+	if not dir:
+		return
+	
+	dir.list_dir_begin()
+	var file_name = dir.get_next()
+	
+	while file_name != "":
+		if CURRENT_MARKER in file_name:
+			var old_path = log_dir + "/" + file_name
+			var new_name = file_name.replace(CURRENT_MARKER, "")
+			var new_path = log_dir + "/" + new_name
+			DirAccess.rename_absolute(old_path, new_path)
+		
+		file_name = dir.get_next()
+	
+	dir.list_dir_end()
+
+
+func _cleanup_rotation_system(log_dir: String) -> void:
+	var tracker_file = log_dir + "/" + ROTATION_TRACKER
+	
+	if FileAccess.file_exists(tracker_file):
+		DirAccess.remove_absolute(tracker_file)
+	
+	_remove_all_current_markers(log_dir)
+
+
+func _get_log_filename(log_dir: String, index: int, with_current: bool) -> String:
+	var marker = CURRENT_MARKER if with_current else ""
+	var file_name = "log%s.txt" % marker if index == 0 else "log%d%s.txt" % [index, marker]
+	return log_dir + "/" + file_name
+
+
+func _delete_log_at_index(log_dir: String, index: int) -> void:
+	var plain = _get_log_filename(log_dir, index, false)
+	var current = _get_log_filename(log_dir, index, true)
+	
+	if FileAccess.file_exists(plain):
+		DirAccess.remove_absolute(plain)
+	
+	if FileAccess.file_exists(current):
+		DirAccess.remove_absolute(current)
+
+
+func _get_last_rotation_index(tracker_file: String) -> int:
+	if not FileAccess.file_exists(tracker_file):
+		return -1
+	
+	var file = FileAccess.open(tracker_file, FileAccess.READ)
+	if not file:
+		return -1
+	
+	var content = file.get_as_text().strip_edges()
+	file.close()
+	
+	return content.to_int() if content.is_valid_int() else -1
+
+
+func _save_last_rotation_index(tracker_file: String, index: int) -> void:
+	var file = FileAccess.open(tracker_file, FileAccess.WRITE)
+	if file:
+		file.store_string(str(index))
+		file.close()
+
+
+## ============================================================================
+## LOGGING API - PUBLIC INTERFACE
+## ============================================================================
+
+func verbose(context: Context, tag: String, msg: String) -> void:
+	_log_internal(Level.VERBOSE, context, tag, msg)
+
+func debug(context: Context, tag: String, msg: String) -> void:
+	_log_internal(Level.DEBUG, context, tag, msg)
+
+func info(context: Context, tag: String, msg: String) -> void:
+	_log_internal(Level.INFO, context, tag, msg)
+
+func warn(context: Context, tag: String, msg: String, throwable: String = "") -> void:
+	_log_internal(Level.WARN, context, tag, msg, throwable)
+
+func error(context: Context, tag: String, msg: String, throwable: String = "") -> void:
+	_log_internal(Level.ERROR, context, tag, msg, throwable)
+
+func fatal(context: Context, tag: String, msg: String, throwable: String = "") -> void:
+	_log_internal(Level.FATAL, context, tag, msg, throwable)
+
+
+## CoreMod-specific logging (routes to CoreMod log + mirrors to Core)
+func log_coremod(level: Level, coremod_id: String, tag: String, msg: String, throwable: String = "") -> void:
+	if _current_state == LoggingState.BOOTSTRAP:
+		error(Context.CORE, "LoggingService", "Cannot log to CoreMod during BOOTSTRAP")
+		return
+	
+	if _current_state == LoggingState.READ_ONLY:
+		# Drop silently in READ_ONLY mode
+		_logs_dropped += 1
+		return
+	
+	if not _coremod_logs.has(coremod_id):
+		error(Context.CORE, "LoggingService", "Attempted to log to unregistered CoreMod: %s" % coremod_id)
+		return
+	
+	# Write to CoreMod log
+	var log_line = _format_log_line(level, tag, msg, throwable)
+	_write_to_file(_coremod_logs[coremod_id], log_line)
+	
+	# Mirror summary to Core log
+	var summary = "[CoreMod:%s] %s" % [coremod_id, msg.substr(0, 80)]
+	if msg.length() > 80:
+		summary += "..."
+	_log_internal(level, Context.CORE, "CoreMod", summary)
+
+
+## ============================================================================
+## PROFILING API
+## ============================================================================
+
+func start_profile(operation_name: String) -> int:
+	var id = _next_profile_id
+	_next_profile_id += 1
+	
+	_active_profiles[id] = {
+		"name": operation_name,
+		"start_time": Time.get_ticks_msec()
+	}
+	
+	debug(Context.CORE, "Profiler", "Started: %s (ID: %d)" % [operation_name, id])
+	return id
+
+
+func end_profile(profile_id: int) -> void:
+	if not _active_profiles.has(profile_id):
+		warn(Context.CORE, "Profiler", "Unknown profile ID: %d" % profile_id)
+		return
+	
+	var entry = _active_profiles[profile_id]
+	var duration = Time.get_ticks_msec() - entry.start_time
+	
+	var duration_str = _format_duration(duration)
+	info(Context.CORE, "Profiler", "✓ %s completed in %s" % [entry.name, duration_str])
+	
+	_active_profiles.erase(profile_id)
+
+
+func cancel_profile(profile_id: int) -> void:
+	_active_profiles.erase(profile_id)
+
+
+func _format_duration(ms: int) -> String:
+	if ms < 1000:
+		return "%dms" % ms
+	elif ms < 60000:
+		return "%.2fs" % (ms / 1000.0)
+	else:
+		return "%dm %ds" % [ms / 60000, (ms % 60000) / 1000]
+
+
+## ============================================================================
+## STATISTICS & DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func get_current_state() -> LoggingState:
+	return _current_state
+
+
+func get_state_name() -> String:
+	return LoggingState.keys()[_current_state]
+
+
+func is_persistent_logging_enabled() -> bool:
+	return _current_state in [LoggingState.FALLBACK, LoggingState.AUTHORIZED]
+
+
+func get_core_log_path() -> String:
+	return _core_log_file
+
+
+func get_coremod_log_path(coremod_id: String) -> String:
+	return _coremod_logs.get(coremod_id, "")
+
+
+func set_min_log_level(level: Level) -> void:
+	_min_log_level = level
+	info(Context.CORE, "LoggingService", "Min log level set to: %s" % Level.keys()[level])
+
+
+func get_logging_stats() -> String:
+	var uptime_sec = (Time.get_ticks_msec() - _start_time) / 1000.0
+	var logs_per_sec = int(_total_logs_written / uptime_sec) if uptime_sec > 0 else 0
+	var mb_written = _total_bytes_written / (1024.0 * 1024.0)
+	
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   LOGGING STATISTICS\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Current State:       %s\n" % get_state_name()
+	stats += "Logs Written:        %d\n" % _total_logs_written
+	stats += "Logs Dropped:        %d\n" % _logs_dropped
+	stats += "Data Written:        %.2f MB\n" % mb_written
+	stats += "Uptime:              %.1f seconds\n" % uptime_sec
+	stats += "Logs/Second:         %d\n" % logs_per_sec
+	stats += "Min Level:           %s\n" % Level.keys()[_min_log_level]
+	stats += "Core Log:            %s\n" % (_core_log_file.get_file() if _core_log_file != "" else "(none)")
+	stats += "CoreMod Logs:        %d registered\n" % _coremod_logs.size()
+	stats += "Active Profiles:     %d\n" % _active_profiles.size()
+	stats += "Bootstrap Buffer:    %d entries\n" % _bootstrap_buffer.size()
+	stats += "═══════════════════════════════════════\n"
+	
+	return stats
+
+
+## ============================================================================
+## INTERNAL IMPLEMENTATION
+## ============================================================================
+
+func _log_internal(level: Level, context: Context, tag: String, msg: String, throwable: String = "") -> void:
+	if not _is_initialized:
+		return
+	
+	if level < _min_log_level:
+		return
+	
+	# During BOOTSTRAP, write to buffer
+	if _current_state == LoggingState.BOOTSTRAP:
+		var level_str = Level.keys()[level]
+		_log_to_buffer("[%s] [%s] %s" % [level_str, tag, msg])
+		return
+	
+	# During READ_ONLY, drop logs
+	if _current_state == LoggingState.READ_ONLY:
+		_logs_dropped += 1
+		return
+	
+	var log_line = _format_log_line(level, tag, msg, throwable)
+	
+	match context:
+		Context.CORE:
+			_write_to_file(_core_log_file, log_line)
+		Context.COREMOD:
+			# This should not be called directly - use log_coremod() instead
+			error(Context.CORE, "LoggingService", "COREMOD context used incorrectly - use log_coremod()")
+	
+	_total_logs_written += 1
+	_total_bytes_written += log_line.length()
+
+
+func _format_log_line(level: Level, tag: String, msg: String, throwable: String) -> String:
+	var timestamp = Time.get_datetime_string_from_system()
+	var level_str = Level.keys()[level].pad_right(7)
+	var log_line = "[%s] %s [%s] %s\n" % [timestamp, level_str, tag, msg]
+	
+	if throwable != "":
+		log_line += "Exception: %s\n" % throwable
+	
+	return log_line
+
+
+func _write_to_file(filepath: String, content: String) -> void:
+	var file = FileAccess.open(filepath, FileAccess.READ_WRITE)
+	if not file:
+		return
+	
+	file.seek_end()
+	file.store_string(content)
+	file.close()
+
+
+func _read_file(filepath: String) -> String:
+	if not FileAccess.file_exists(filepath):
+		return ""
+	
+	var file = FileAccess.open(filepath, FileAccess.READ)
+	if not file:
+		return ""
+	
+	var content = file.get_as_text()
+	file.close()
+	return content
+
+
+## ============================================================================
+## SHUTDOWN
+## ============================================================================
+
+func shutdown() -> void:
+	info(Context.CORE, "LoggingService", "═══════════════════════════════════════")
+	info(Context.CORE, "LoggingService", "   SHUTTING DOWN")
+	info(Context.CORE, "LoggingService", "═══════════════════════════════════════")
+	info(Context.CORE, "LoggingService", get_logging_stats())
+	
+	if _active_profiles.size() > 0:
+		warn(Context.CORE, "LoggingService", "Shutting down with %d active profiles" % _active_profiles.size())
+	
+	_is_initialized = false
+
+
+res://axiom-runtime-/core/logging/LoggingService.gd.uid
+
+## LoggingService.gd.uid
+## Directory: /axiom-runtime-/core/logging/LoggingService.gd.uid
+##
+
+uid://dsbya48nuaxnm
+
+

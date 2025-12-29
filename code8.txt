@@ -1,0 +1,62 @@
+res://axiom-runtime-/project.godot
+
+## project.godot
+## Directory: /axiom-runtime-/project.godot
+##
+
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[application]
+
+config/name="Axiom Runtime"
+config/description="Mod-first game platform - immutable runtime core"
+config/version="1.0.0-Phase6"
+config/tags=PackedStringArray("platform", "modding", "runtime")
+run/main_scene="res://core/test_scenes/Phase6Test.tscn"
+config/features=PackedStringArray("4.5", "Mobile")
+boot_splash/bg_color=Color(0.141176, 0.141176, 0.141176, 1)
+config/icon="res://icon.svg"
+boot_splash/show_image=false
+
+[autoload]
+
+LoggingService="*res://core/logging/LoggingService.gd"
+PermissionManager="*res://core/permissions/PermissionManager.gd"
+EventBus="*res://core/services/EventBus.gd"
+RegistryManager="*res://core/services/RegistryManager.gd"
+VirtualFileSystem="*res://core/services/VirtualFileSystem.gd"
+DependencyResolver="*res://core/modding/DependencyResolver.gd"
+ModLoader="*res://core/modding/ModLoader.gd"
+MetadataParser="*res://core/metadata/MetadataParser.gd"
+IDGenerator="*res://core/metadata/IDGenerator.gd"
+ContractValidator="*res://core/metadata/ContractValidator.gd"
+BindingGenerator="*res://core/metadata/BindingGenerator.gd"
+MetadataManager="*res://core/metadata/MetadataManager.gd"
+ContractRegistry="*res://core/contracts/ContractRegistry.gd"
+CapabilityGrant="*res://core/contracts/CapabilityGrant.gd"
+Bootstrap="*res://core/Bootstrap.gd"
+
+[display]
+
+window/size/viewport_width=1080
+window/size/viewport_height=2340
+window/size/mode=3
+window/size/resizable=false
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/handheld/orientation=1
+
+[rendering]
+
+renderer/rendering_method="mobile"
+textures/vram_compression/import_etc2_astc=true
+
+

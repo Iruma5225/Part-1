@@ -1,0 +1,1308 @@
+res://axiom-runtime-/core/metadata/MetadataManager.gd
+
+## MetadataManager.gd
+## Directory: /axiom-runtime-/core/metadata/MetadataManager.gd
+##
+
+## MetadataManager.gd
+## Phase 5: Metadata & Code Generation - Orchestrates metadata pipeline
+## Directory: /core/metadata/MetadataManager.gd
+##
+## CRITICAL: Manages entire metadata → binding generation pipeline
+## Semantic-free orchestration of parsing, validation, ID generation, and code gen
+
+extends Node
+
+const VERSION = "1.0.0"
+
+## Pipeline result
+class PipelineResult:
+	var success: bool
+	var stage: String  # Which stage succeeded/failed
+	var parse_result: MetadataParser.ValidationResult
+	var completeness_result: ContractValidator.CompletenessResult
+	var id_map: Dictionary
+	var generation_result: BindingGenerator.GenerationResult
+	var errors: Array[String]
+	
+	func _init():
+		success = false
+		stage = "not_started"
+		id_map = {}
+		errors = []
+	
+	func add_error(msg: String) -> void:
+		errors.append(msg)
+		success = false
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "Initialized v%s" % VERSION)
+
+
+## ============================================================================
+## FULL PIPELINE
+## ============================================================================
+
+func process_coremod_metadata(metadata_path: String, output_dir: String) -> PipelineResult:
+	"""
+	Process CoreMod metadata through full pipeline:
+	1. Parse YAML
+	2. Validate structure
+	3. Check completeness
+	4. Generate IDs
+	5. Generate bindings
+	
+	Args:
+		metadata_path: Path to coremod.yaml
+		output_dir: Output directory for generated bindings
+	
+	Returns:
+		PipelineResult with all stage results
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "Processing CoreMod metadata pipeline...")
+	
+	var result = PipelineResult.new()
+	
+	# Stage 1: Parse metadata
+	result.stage = "parsing"
+	result.parse_result = MetadataParser.parse_coremod_metadata(metadata_path)
+	
+	if not result.parse_result.is_valid():
+		result.add_error("Metadata parsing failed")
+		_log_parse_errors(result.parse_result)
+		return result
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Stage 1: Metadata parsed")
+	
+	# Stage 2: Validate completeness
+	result.stage = "validation"
+	result.completeness_result = ContractValidator.validate_completeness(result.parse_result.parsed_data)
+	
+	if not result.completeness_result.complete:
+		result.add_error("Contract completeness validation failed")
+		_log_completeness_warnings(result.completeness_result)
+		# Continue anyway - not a hard failure
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Stage 2: Completeness validated (%.1f%% coverage)" % result.completeness_result.coverage_percentage)
+	
+	# Stage 3: Generate IDs
+	result.stage = "id_generation"
+	var coremod_id = result.parse_result.parsed_data.get("id", "unknown")
+	result.id_map = IDGenerator.generate_ids_from_metadata(result.parse_result.parsed_data, coremod_id)
+	
+	if result.id_map.is_empty():
+		result.add_error("No IDs generated - no contracts to process")
+		return result
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Stage 3: Generated %d IDs" % result.id_map.size())
+	
+	# Stage 4: Validate cross-references
+	result.stage = "cross_reference_validation"
+	var ref_errors = ContractValidator.validate_cross_references(result.parse_result.parsed_data, result.id_map)
+	
+	if not ref_errors.is_empty():
+		for error in ref_errors:
+			result.add_error(error)
+		return result
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Stage 4: Cross-references validated")
+	
+	# Stage 5: Generate bindings
+	result.stage = "binding_generation"
+	result.generation_result = BindingGenerator.generate_bindings(result.parse_result.parsed_data, result.id_map, output_dir)
+	
+	if not result.generation_result.success:
+		result.add_error("Binding generation failed")
+		_log_generation_errors(result.generation_result)
+		return result
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Stage 5: Generated %d binding files" % result.generation_result.generated_files.size())
+	
+	# Success
+	result.success = true
+	result.stage = "complete"
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Pipeline complete - bindings ready")
+	
+	return result
+
+
+## ============================================================================
+## MOD METADATA PROCESSING
+## ============================================================================
+
+func process_mod_metadata(metadata_path: String, coremod_contracts: Dictionary) -> PipelineResult:
+	"""
+	Process mod metadata and validate against CoreMod contracts.
+	
+	Args:
+		metadata_path: Path to mod.yaml
+		coremod_contracts: CoreMod's contract declarations
+	
+	Returns:
+		PipelineResult with validation results
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "Processing mod metadata...")
+	
+	var result = PipelineResult.new()
+	
+	# Stage 1: Parse metadata
+	result.stage = "parsing"
+	result.parse_result = MetadataParser.parse_mod_metadata(metadata_path)
+	
+	if not result.parse_result.is_valid():
+		result.add_error("Mod metadata parsing failed")
+		_log_parse_errors(result.parse_result)
+		return result
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Mod metadata parsed")
+	
+	# Stage 2: Validate compatibility with CoreMod
+	result.stage = "compatibility_validation"
+	var compat_errors = ContractValidator.validate_mod_compatibility(result.parse_result.parsed_data, coremod_contracts)
+	
+	if not compat_errors.is_empty():
+		for error in compat_errors:
+			result.add_error(error)
+		return result
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "✓ Mod compatible with CoreMod")
+	
+	# Success
+	result.success = true
+	result.stage = "complete"
+	
+	return result
+
+
+## ============================================================================
+## BATCH PROCESSING
+## ============================================================================
+
+func process_all_mods_in_directory(mods_dir: String, coremod_contracts: Dictionary) -> Array[PipelineResult]:
+	"""
+	Process all mod metadata files in a directory.
+	
+	Returns:
+		Array of PipelineResults, one per mod
+	"""
+	
+	var results: Array[PipelineResult] = []
+	
+	if not DirAccess.dir_exists_absolute(mods_dir):
+		LoggingService.error(LoggingService.Context.CORE, "MetadataManager", "Mods directory not found: %s" % mods_dir)
+		return results
+	
+	var dir = DirAccess.open(mods_dir)
+	if not dir:
+		return results
+	
+	dir.list_dir_begin()
+	var entry = dir.get_next()
+	
+	while entry != "":
+		if dir.current_is_dir() and not entry.begins_with("."):
+			var mod_path = mods_dir.path_join(entry)
+			var metadata_file = mod_path.path_join("mod.yaml")
+			
+			if FileAccess.file_exists(metadata_file):
+				var result = process_mod_metadata(metadata_file, coremod_contracts)
+				results.append(result)
+		
+		entry = dir.get_next()
+	
+	dir.list_dir_end()
+	
+	LoggingService.info(LoggingService.Context.CORE, "MetadataManager", "Processed %d mods" % results.size())
+	
+	return results
+
+
+## ============================================================================
+## LOGGING HELPERS
+## ============================================================================
+
+func _log_parse_errors(parse_result: MetadataParser.ValidationResult) -> void:
+	"""
+	Log parsing errors.
+	"""
+	for error in parse_result.errors:
+		LoggingService.error(LoggingService.Context.CORE, "MetadataManager", "Parse error: %s" % error)
+	
+	for warning in parse_result.warnings:
+		LoggingService.warn(LoggingService.Context.CORE, "MetadataManager", "Parse warning: %s" % warning)
+
+
+func _log_completeness_warnings(completeness_result: ContractValidator.CompletenessResult) -> void:
+	"""
+	Log completeness warnings.
+	"""
+	for missing in completeness_result.missing_contracts:
+		LoggingService.warn(LoggingService.Context.CORE, "MetadataManager", "Missing contract: %s" % missing)
+	
+	for warning in completeness_result.warnings:
+		LoggingService.warn(LoggingService.Context.CORE, "MetadataManager", "Completeness warning: %s" % warning)
+
+
+func _log_generation_errors(generation_result: BindingGenerator.GenerationResult) -> void:
+	"""
+	Log generation errors.
+	"""
+	for error in generation_result.errors:
+		LoggingService.error(LoggingService.Context.CORE, "MetadataManager", "Generation error: %s" % error)
+	
+	for warning in generation_result.warnings:
+		LoggingService.warn(LoggingService.Context.CORE, "MetadataManager", "Generation warning: %s" % warning)
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func format_pipeline_result(result: PipelineResult) -> String:
+	"""
+	Format complete pipeline result for logging.
+	"""
+	
+	var output = ""
+	output += "═══════════════════════════════════════\n"
+	output += "   METADATA PIPELINE RESULT\n"
+	output += "═══════════════════════════════════════\n"
+	output += "Success:  %s\n" % str(result.success)
+	output += "Stage:    %s\n" % result.stage
+	output += "Errors:   %d\n" % result.errors.size()
+	output += "\n"
+	
+	if not result.errors.is_empty():
+		output += "ERRORS:\n"
+		for error in result.errors:
+			output += "  ✗ %s\n" % error
+		output += "\n"
+	
+	if result.parse_result:
+		output += "PARSING:\n"
+		output += "  Valid: %s\n" % str(result.parse_result.is_valid())
+		if result.parse_result.is_valid():
+			output += "  ID:    %s\n" % result.parse_result.parsed_data.get("id", "unknown")
+		output += "\n"
+	
+	if result.completeness_result:
+		output += "COMPLETENESS:\n"
+		output += "  Complete:  %s\n" % str(result.completeness_result.complete)
+		output += "  Coverage:  %.1f%%\n" % result.completeness_result.coverage_percentage
+		output += "  Contracts: %d\n" % result.completeness_result.contract_count
+		output += "\n"
+	
+	if not result.id_map.is_empty():
+		output += "ID GENERATION:\n"
+		output += "  IDs Generated: %d\n" % result.id_map.size()
+		output += "\n"
+	
+	if result.generation_result:
+		output += "BINDING GENERATION:\n"
+		output += "  Success: %s\n" % str(result.generation_result.success)
+		output += "  Files:   %d\n" % result.generation_result.generated_files.size()
+	
+	output += "═══════════════════════════════════════\n"
+	
+	return output
+
+
+## ============================================================================
+## UTILITY
+## ============================================================================
+
+func get_coremod_contracts_from_metadata(metadata_path: String) -> Dictionary:
+	"""
+	Extract contract declarations from CoreMod metadata.
+	Used for mod validation.
+	"""
+	
+	var parse_result = MetadataParser.parse_coremod_metadata(metadata_path)
+	
+	if not parse_result.is_valid():
+		return {}
+	
+	return parse_result.parsed_data.get("contracts", {})
+
+
+res://axiom-runtime-/core/metadata/MetadataManager.gd.uid
+
+## MetadataManager.gd.uid
+## Directory: /axiom-runtime-/core/metadata/MetadataManager.gd.uid
+##
+
+uid://c2gm24jthffx7
+
+
+res://axiom-runtime-/core/metadata/MetadataParser.gd
+
+## MetadataParser.gd
+## Directory: /axiom-runtime-/core/metadata/MetadataParser.gd
+##
+
+## MetadataParser.gd
+## Phase 5: Metadata & Code Generation - YAML metadata parser
+## Directory: /core/metadata/MetadataParser.gd
+##
+## CRITICAL: Parses mod and CoreMod metadata without semantic interpretation
+## Validates structure and required fields only
+## Core remains semantic-free - only validates syntax
+
+extends Node
+
+const VERSION = "1.0.0"
+
+## Metadata validation result
+class ValidationResult:
+	var success: bool
+	var errors: Array[String]
+	var warnings: Array[String]
+	var parsed_data: Dictionary
+	
+	func _init():
+		success = false
+		errors = []
+		warnings = []
+		parsed_data = {}
+	
+	func add_error(msg: String) -> void:
+		errors.append(msg)
+		success = false
+	
+	func add_warning(msg: String) -> void:
+		warnings.append(msg)
+	
+	func is_valid() -> bool:
+		return success and errors.is_empty()
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "MetadataParser", "Initialized v%s" % VERSION)
+
+
+## ============================================================================
+## MOD METADATA PARSING
+## ============================================================================
+
+func parse_mod_metadata(file_path: String) -> ValidationResult:
+	"""
+	Parse mod metadata from mod.yaml.
+	Validates structure and required fields only.
+	"""
+	
+	LoggingService.debug(LoggingService.Context.CORE, "MetadataParser", "Parsing mod metadata: %s" % file_path)
+	
+	var result = ValidationResult.new()
+	
+	if not FileAccess.file_exists(file_path):
+		result.add_error("Metadata file not found: %s" % file_path)
+		return result
+	
+	# Read file
+	var file = FileAccess.open(file_path, FileAccess.READ)
+	if not file:
+		result.add_error("Cannot read metadata file: %s" % file_path)
+		return result
+	
+	var yaml_text = file.get_as_text()
+	file.close()
+	
+	# Parse YAML (using simple key-value parser for now)
+	# NOTE: Godot doesn't have built-in YAML support, so we use JSON-like syntax
+	# In production, integrate a proper YAML parser
+	var parsed = _parse_yaml_simple(yaml_text)
+	
+	if parsed.is_empty():
+		result.add_error("Failed to parse YAML")
+		return result
+	
+	result.parsed_data = parsed
+	
+	# Validate required fields
+	_validate_mod_required_fields(parsed, result)
+	
+	# Validate optional fields
+	_validate_mod_optional_fields(parsed, result)
+	
+	if result.errors.is_empty():
+		result.success = true
+		LoggingService.debug(LoggingService.Context.CORE, "MetadataParser", "✓ Mod metadata valid: %s" % parsed.get("id", "unknown"))
+	
+	return result
+
+
+func _validate_mod_required_fields(data: Dictionary, result: ValidationResult) -> void:
+	"""
+	Validate required fields for mod metadata.
+	"""
+	
+	# Required: id
+	if not data.has("id") or data["id"] == "":
+		result.add_error("Missing required field: 'id'")
+	elif not _is_valid_id(data["id"]):
+		result.add_error("Invalid id format: '%s' (must be alphanumeric with underscores/hyphens)" % data["id"])
+	
+	# Required: version
+	if not data.has("version") or data["version"] == "":
+		result.add_error("Missing required field: 'version'")
+	elif not _is_valid_version(data["version"]):
+		result.add_error("Invalid version format: '%s' (must be semver: X.Y.Z)" % data["version"])
+	
+	# Required: name
+	if not data.has("name") or data["name"] == "":
+		result.add_error("Missing required field: 'name'")
+	
+	# Required: target_coremod
+	if not data.has("target_coremod") or data["target_coremod"] == "":
+		result.add_error("Missing required field: 'target_coremod'")
+
+
+func _validate_mod_optional_fields(data: Dictionary, result: ValidationResult) -> void:
+	"""
+	Validate optional fields and their structure.
+	"""
+	
+	# Optional: description
+	if data.has("description") and typeof(data["description"]) != TYPE_STRING:
+		result.add_warning("Field 'description' should be a string")
+	
+	# Optional: author
+	if data.has("author") and typeof(data["author"]) != TYPE_STRING:
+		result.add_warning("Field 'author' should be a string")
+	
+	# Optional: dependencies (array)
+	if data.has("dependencies"):
+		if typeof(data["dependencies"]) != TYPE_ARRAY:
+			result.add_error("Field 'dependencies' must be an array")
+		else:
+			_validate_dependencies(data["dependencies"], result)
+	
+	# Optional: capabilities (array)
+	if data.has("capabilities"):
+		if typeof(data["capabilities"]) != TYPE_ARRAY:
+			result.add_error("Field 'capabilities' must be an array")
+		else:
+			_validate_capabilities(data["capabilities"], result)
+	
+	# Optional: contracts (dictionary)
+	if data.has("contracts"):
+		if typeof(data["contracts"]) != TYPE_DICTIONARY:
+			result.add_error("Field 'contracts' must be a dictionary")
+
+
+func _validate_dependencies(deps: Array, result: ValidationResult) -> void:
+	"""
+	Validate dependency declarations.
+	"""
+	
+	for dep in deps:
+		if typeof(dep) == TYPE_STRING:
+			# Simple string dependency: "mod_id"
+			if not _is_valid_id(dep):
+				result.add_error("Invalid dependency id: '%s'" % dep)
+		elif typeof(dep) == TYPE_DICTIONARY:
+			# Structured dependency: {id: "mod_id", version: "^1.0.0"}
+			if not dep.has("id"):
+				result.add_error("Dependency missing 'id' field")
+			elif not _is_valid_id(dep["id"]):
+				result.add_error("Invalid dependency id: '%s'" % dep["id"])
+			
+			if dep.has("version") and not _is_valid_version_range(dep["version"]):
+				result.add_error("Invalid version range: '%s'" % dep["version"])
+		else:
+			result.add_error("Invalid dependency format (must be string or dictionary)")
+
+
+func _validate_capabilities(caps: Array, result: ValidationResult) -> void:
+	"""
+	Validate capability declarations.
+	Capabilities are opaque strings at Core level.
+	"""
+	
+	for cap in caps:
+		if typeof(cap) != TYPE_STRING:
+			result.add_error("Capability must be a string")
+		elif cap == "":
+			result.add_error("Capability cannot be empty")
+
+
+## ============================================================================
+## COREMOD METADATA PARSING
+## ============================================================================
+
+func parse_coremod_metadata(file_path: String) -> ValidationResult:
+	"""
+	Parse CoreMod metadata from coremod.yaml.
+	Validates structure and contract declarations.
+	"""
+	
+	LoggingService.debug(LoggingService.Context.CORE, "MetadataParser", "Parsing CoreMod metadata: %s" % file_path)
+	
+	var result = ValidationResult.new()
+	
+	if not FileAccess.file_exists(file_path):
+		result.add_error("CoreMod metadata file not found: %s" % file_path)
+		return result
+	
+	# Read file
+	var file = FileAccess.open(file_path, FileAccess.READ)
+	if not file:
+		result.add_error("Cannot read CoreMod metadata file: %s" % file_path)
+		return result
+	
+	var yaml_text = file.get_as_text()
+	file.close()
+	
+	# Parse YAML
+	var parsed = _parse_yaml_simple(yaml_text)
+	
+	if parsed.is_empty():
+		result.add_error("Failed to parse YAML")
+		return result
+	
+	result.parsed_data = parsed
+	
+	# Validate CoreMod fields
+	_validate_coremod_required_fields(parsed, result)
+	_validate_coremod_contracts(parsed, result)
+	
+	if result.errors.is_empty():
+		result.success = true
+		LoggingService.debug(LoggingService.Context.CORE, "MetadataParser", "✓ CoreMod metadata valid: %s" % parsed.get("id", "unknown"))
+	
+	return result
+
+
+func _validate_coremod_required_fields(data: Dictionary, result: ValidationResult) -> void:
+	"""
+	Validate required fields for CoreMod metadata.
+	"""
+	
+	# Required: id
+	if not data.has("id") or data["id"] == "":
+		result.add_error("Missing required field: 'id'")
+	elif not _is_valid_id(data["id"]):
+		result.add_error("Invalid id format: '%s'" % data["id"])
+	
+	# Required: version
+	if not data.has("version") or data["version"] == "":
+		result.add_error("Missing required field: 'version'")
+	elif not _is_valid_version(data["version"]):
+		result.add_error("Invalid version format: '%s'" % data["version"])
+	
+	# Required: name
+	if not data.has("name") or data["name"] == "":
+		result.add_error("Missing required field: 'name'")
+	
+	# Required: contracts (CoreMods must expose contracts)
+	if not data.has("contracts"):
+		result.add_error("CoreMod must define 'contracts'")
+
+
+func _validate_coremod_contracts(data: Dictionary, result: ValidationResult) -> void:
+	"""
+	Validate CoreMod contract declarations.
+	Core validates structure only, not semantics.
+	"""
+	
+	if not data.has("contracts"):
+		return
+	
+	var contracts = data["contracts"]
+	
+	if typeof(contracts) != TYPE_DICTIONARY:
+		result.add_error("Field 'contracts' must be a dictionary")
+		return
+	
+	# Validate each contract type
+	for contract_type in contracts.keys():
+		var contract_list = contracts[contract_type]
+		
+		if typeof(contract_list) != TYPE_ARRAY:
+			result.add_error("Contract type '%s' must be an array" % contract_type)
+			continue
+		
+		match contract_type:
+			"events":
+				_validate_event_contracts(contract_list, result)
+			"systems":
+				_validate_system_contracts(contract_list, result)
+			"registries":
+				_validate_registry_contracts(contract_list, result)
+			_:
+				result.add_warning("Unknown contract type: '%s'" % contract_type)
+
+
+func _validate_event_contracts(events: Array, result: ValidationResult) -> void:
+	"""
+	Validate event contract declarations.
+	"""
+	
+	for event in events:
+		if typeof(event) != TYPE_DICTIONARY:
+			result.add_error("Event contract must be a dictionary")
+			continue
+		
+		# Required: id
+		if not event.has("id"):
+			result.add_error("Event contract missing 'id'")
+		
+		# Optional: cancellable
+		if event.has("cancellable") and typeof(event["cancellable"]) != TYPE_BOOL:
+			result.add_warning("Event 'cancellable' should be boolean")
+		
+		# Optional: payload_schema
+		if event.has("payload_schema") and typeof(event["payload_schema"]) != TYPE_DICTIONARY:
+			result.add_warning("Event 'payload_schema' should be a dictionary")
+
+
+func _validate_system_contracts(systems: Array, result: ValidationResult) -> void:
+	"""
+	Validate system contract declarations.
+	"""
+	
+	for system in systems:
+		if typeof(system) != TYPE_DICTIONARY:
+			result.add_error("System contract must be a dictionary")
+			continue
+		
+		# Required: id
+		if not system.has("id"):
+			result.add_error("System contract missing 'id'")
+		
+		# Required: overrideable
+		if not system.has("overrideable"):
+			result.add_error("System contract missing 'overrideable' flag")
+		elif typeof(system["overrideable"]) != TYPE_BOOL:
+			result.add_error("System 'overrideable' must be boolean")
+
+
+func _validate_registry_contracts(registries: Array, result: ValidationResult) -> void:
+	"""
+	Validate registry contract declarations.
+	"""
+	
+	for registry in registries:
+		if typeof(registry) != TYPE_DICTIONARY:
+			result.add_error("Registry contract must be a dictionary")
+			continue
+		
+		# Required: id
+		if not registry.has("id"):
+			result.add_error("Registry contract missing 'id'")
+		
+		# Optional: schema
+		if registry.has("schema") and typeof(registry["schema"]) != TYPE_DICTIONARY:
+			result.add_warning("Registry 'schema' should be a dictionary")
+
+
+## ============================================================================
+## YAML PARSING (Simple Implementation)
+## ============================================================================
+
+func _parse_yaml_simple(yaml_text: String) -> Dictionary:
+	"""
+	Simple YAML parser for basic key-value pairs.
+	NOTE: This is a minimal implementation. In production, use a proper YAML library.
+	"""
+	
+	var result = {}
+	var lines = yaml_text.split("\n")
+	var current_section = result
+	var section_stack = [result]
+	var indent_stack = [0]
+	
+	for line in lines:
+		var trimmed = line.strip_edges()
+		
+		# Skip empty lines and comments
+		if trimmed == "" or trimmed.begins_with("#"):
+			continue
+		
+		# Calculate indentation
+		var indent = 0
+		for c in line:
+			if c == " ":
+				indent += 1
+			elif c == "\t":
+				indent += 4
+			else:
+				break
+		
+		# Handle indentation changes
+		while indent_stack.size() > 1 and indent < indent_stack[-1]:
+			indent_stack.pop_back()
+			section_stack.pop_back()
+			current_section = section_stack[-1]
+		
+		# Parse line
+		if ":" in trimmed:
+			var parts = trimmed.split(":", true, 1)
+			var key = parts[0].strip_edges()
+			var value = parts[1].strip_edges() if parts.size() > 1 else ""
+			
+			# Handle arrays
+			if value == "" or value == "[" or value == "]":
+				# Section or array start
+				var new_section = {}
+				current_section[key] = new_section
+				section_stack.append(new_section)
+				indent_stack.append(indent)
+				current_section = new_section
+			else:
+				# Simple value
+				current_section[key] = _parse_yaml_value(value)
+		elif trimmed.begins_with("-"):
+			# Array item
+			var value = trimmed.substr(1).strip_edges()
+			
+			# Ensure current section is an array
+			if typeof(current_section) != TYPE_ARRAY:
+				var array = []
+				var parent = section_stack[-2] if section_stack.size() > 1 else result
+				# Replace dict with array in parent
+				for k in parent.keys():
+					if parent[k] == current_section:
+						parent[k] = array
+						break
+				current_section = array
+				section_stack[-1] = array
+			
+			current_section.append(_parse_yaml_value(value))
+	
+	return result
+
+
+func _parse_yaml_value(value: String) -> Variant:
+	"""
+	Parse YAML value to appropriate type.
+	"""
+	
+	# Boolean
+	if value.to_lower() == "true":
+		return true
+	if value.to_lower() == "false":
+		return false
+	
+	# Null
+	if value.to_lower() == "null" or value == "~":
+		return null
+	
+	# Number
+	if value.is_valid_int():
+		return value.to_int()
+	if value.is_valid_float():
+		return value.to_float()
+	
+	# String (remove quotes if present)
+	if (value.begins_with('"') and value.ends_with('"')) or (value.begins_with("'") and value.ends_with("'")):
+		return value.substr(1, value.length() - 2)
+	
+	return value
+
+
+## ============================================================================
+## VALIDATION HELPERS
+## ============================================================================
+
+func _is_valid_id(id: String) -> bool:
+	"""
+	Validate ID format: alphanumeric with underscores/hyphens.
+	"""
+	
+	if id == "":
+		return false
+	
+	var regex = RegEx.new()
+	regex.compile("^[a-zA-Z0-9_-]+$")
+	return regex.search(id) != null
+
+
+func _is_valid_version(version: String) -> bool:
+	"""
+	Validate semver format: X.Y.Z
+	"""
+	
+	var regex = RegEx.new()
+	regex.compile("^\\d+\\.\\d+\\.\\d+$")
+	return regex.search(version) != null
+
+
+func _is_valid_version_range(version: String) -> bool:
+	"""
+	Validate version range format: >=X.Y.Z, ^X.Y.Z, etc.
+	"""
+	
+	if version == "*":
+		return true
+	
+	# Remove prefix
+	var clean = version
+	if version.begins_with(">=") or version.begins_with("<="):
+		clean = version.substr(2).strip_edges()
+	elif version.begins_with("^") or version.begins_with("~") or version.begins_with(">") or version.begins_with("<"):
+		clean = version.substr(1).strip_edges()
+	
+	return _is_valid_version(clean)
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func format_validation_result(result: ValidationResult) -> String:
+	"""
+	Format validation result for logging.
+	"""
+	
+	var output = ""
+	output += "═══════════════════════════════════════\n"
+	output += "   METADATA VALIDATION RESULT\n"
+	output += "═══════════════════════════════════════\n"
+	output += "Valid:    %s\n" % str(result.is_valid())
+	output += "Errors:   %d\n" % result.errors.size()
+	output += "Warnings: %d\n" % result.warnings.size()
+	output += "\n"
+	
+	if not result.errors.is_empty():
+		output += "ERRORS:\n"
+		for error in result.errors:
+			output += "  ✗ %s\n" % error
+		output += "\n"
+	
+	if not result.warnings.is_empty():
+		output += "WARNINGS:\n"
+		for warning in result.warnings:
+			output += "  ⚠ %s\n" % warning
+		output += "\n"
+	
+	if result.is_valid():
+		output += "PARSED DATA:\n"
+		output += "  ID:      %s\n" % result.parsed_data.get("id", "unknown")
+		output += "  Version: %s\n" % result.parsed_data.get("version", "unknown")
+		output += "  Name:    %s\n" % result.parsed_data.get("name", "unknown")
+	
+	output += "═══════════════════════════════════════\n"
+	
+	return output
+
+
+res://axiom-runtime-/core/metadata/MetadataParser.gd.uid
+
+## MetadataParser.gd.uid
+## Directory: /axiom-runtime-/core/metadata/MetadataParser.gd.uid
+##
+
+uid://b86s4sj1ph4xq
+
+
+res://axiom-runtime-/core/modding/DependencyResolver.gd
+
+## DependencyResolver.gd
+## Directory: /axiom-runtime-/core/modding/DependencyResolver.gd
+##
+
+## DependencyResolver.gd
+## Phase 4: Mod Loader & Lifecycle - Dependency resolution and load ordering
+## Directory: /core/modding/DependencyResolver.gd
+##
+## CRITICAL: Deterministic, observable dependency resolution
+## Detects cycles, missing dependencies, and version conflicts
+## No semantic interpretation - works with IDs and version strings only
+
+extends Node
+
+const VERSION = "1.0.0"
+
+## Resolution result
+class ResolutionResult:
+	var success: bool
+	var load_order: Array[String]  # Ordered list of mod IDs
+	var errors: Array[String]
+	var warnings: Array[String]
+	
+	func _init():
+		success = false
+		load_order = []
+		errors = []
+		warnings = []
+	
+	func add_error(msg: String) -> void:
+		errors.append(msg)
+		success = false
+	
+	func add_warning(msg: String) -> void:
+		warnings.append(msg)
+	
+	func is_successful() -> bool:
+		return success and errors.is_empty()
+
+## Dependency graph node
+class DepNode:
+	var mod_id: String
+	var metadata: Dictionary
+	var dependencies: Array[String]
+	var dependents: Array[String]  # Who depends on this
+	var depth: int  # For topological sort
+	var visited: bool
+	var in_stack: bool  # For cycle detection
+	
+	func _init(id: String, meta: Dictionary):
+		mod_id = id
+		metadata = meta
+		dependencies = []
+		dependents = []
+		depth = 0
+		visited = false
+		in_stack = false
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "DependencyResolver", "Initialized v%s" % VERSION)
+
+
+## ============================================================================
+## DEPENDENCY RESOLUTION
+## ============================================================================
+
+func resolve_dependencies(mod_metadata_list: Array[Dictionary]) -> ResolutionResult:
+	"""
+	Resolve dependencies and generate load order.
+	
+	Args:
+		mod_metadata_list: Array of mod metadata dictionaries
+	
+	Returns:
+		ResolutionResult with load order or errors
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "DependencyResolver", "Resolving dependencies for %d mods..." % mod_metadata_list.size())
+	
+	var result = ResolutionResult.new()
+	
+	if mod_metadata_list.is_empty():
+		result.add_warning("No mods to resolve")
+		result.success = true
+		return result
+	
+	# Step 1: Build dependency graph
+	var graph = _build_dependency_graph(mod_metadata_list, result)
+	if not result.errors.is_empty():
+		return result
+	
+	# Step 2: Validate dependencies exist
+	_validate_dependencies(graph, result)
+	if not result.errors.is_empty():
+		return result
+	
+	# Step 3: Detect cycles
+	_detect_cycles(graph, result)
+	if not result.errors.is_empty():
+		return result
+	
+	# Step 4: Topological sort for load order
+	result.load_order = _topological_sort(graph, result)
+	if not result.errors.is_empty():
+		return result
+	
+	result.success = true
+	LoggingService.info(LoggingService.Context.CORE, "DependencyResolver", "✓ Resolution successful - load order determined")
+	
+	return result
+
+
+func _build_dependency_graph(mod_list: Array[Dictionary], result: ResolutionResult) -> Dictionary:
+	"""
+	Build dependency graph from mod metadata.
+	Returns {mod_id: DepNode}
+	"""
+	
+	var graph: Dictionary = {}
+	
+	# Create nodes
+	for mod_meta in mod_list:
+		var mod_id = mod_meta.get("id", "")
+		if mod_id == "":
+			result.add_error("Mod missing 'id' field")
+			continue
+		
+		if graph.has(mod_id):
+			result.add_error("Duplicate mod ID: %s" % mod_id)
+			continue
+		
+		var node = DepNode.new(mod_id, mod_meta)
+		graph[mod_id] = node
+		
+		# Extract dependencies
+		var deps = mod_meta.get("dependencies", [])
+		if typeof(deps) == TYPE_ARRAY:
+			for dep in deps:
+				if typeof(dep) == TYPE_STRING:
+					node.dependencies.append(dep)
+				elif typeof(dep) == TYPE_DICTIONARY:
+					var dep_id = dep.get("id", "")
+					if dep_id != "":
+						node.dependencies.append(dep_id)
+	
+	# Build reverse dependencies (dependents)
+	for node in graph.values():
+		for dep_id in node.dependencies:
+			if graph.has(dep_id):
+				graph[dep_id].dependents.append(node.mod_id)
+	
+	return graph
+
+
+func _validate_dependencies(graph: Dictionary, result: ResolutionResult) -> void:
+	"""
+	Check that all dependencies exist in the graph.
+	"""
+	
+	for node in graph.values():
+		for dep_id in node.dependencies:
+			if not graph.has(dep_id):
+				result.add_error("Mod '%s' depends on missing mod: '%s'" % [node.mod_id, dep_id])
+
+
+func _detect_cycles(graph: Dictionary, result: ResolutionResult) -> void:
+	"""
+	Detect circular dependencies using DFS.
+	"""
+	
+	var cycle_path: Array[String] = []
+	
+	for node in graph.values():
+		if not node.visited:
+			if _dfs_cycle_detection(node, graph, cycle_path):
+				var cycle_str = " -> ".join(cycle_path)
+				result.add_error("Circular dependency detected: %s" % cycle_str)
+				return
+	
+	LoggingService.debug(LoggingService.Context.CORE, "DependencyResolver", "No cycles detected")
+
+
+func _dfs_cycle_detection(node: DepNode, graph: Dictionary, path: Array[String]) -> bool:
+	"""
+	DFS for cycle detection.
+	Returns true if cycle found.
+	"""
+	
+	node.visited = true
+	node.in_stack = true
+	path.append(node.mod_id)
+	
+	for dep_id in node.dependencies:
+		if not graph.has(dep_id):
+			continue
+		
+		var dep_node: DepNode = graph[dep_id]
+		
+		if dep_node.in_stack:
+			# Cycle found
+			path.append(dep_id)
+			return true
+		
+		if not dep_node.visited:
+			if _dfs_cycle_detection(dep_node, graph, path):
+				return true
+	
+	node.in_stack = false
+	path.pop_back()
+	return false
+
+
+func _topological_sort(graph: Dictionary, result: ResolutionResult) -> Array[String]:
+	"""
+	Perform topological sort to determine load order.
+	Dependencies load before dependents.
+	"""
+	
+	var sorted: Array[String] = []
+	var visited: Dictionary = {}
+	
+	# Reset visited flags
+	for node in graph.values():
+		node.visited = false
+	
+	# Visit all nodes
+	for node in graph.values():
+		if not node.visited:
+			_dfs_topological(node, graph, sorted, visited)
+	
+	# Reverse to get correct order (dependencies first)
+	sorted.reverse()
+	
+	LoggingService.debug(LoggingService.Context.CORE, "DependencyResolver", "Load order: %s" % str(sorted))
+	
+	return sorted
+
+
+func _dfs_topological(node: DepNode, graph: Dictionary, sorted: Array[String], visited: Dictionary) -> void:
+	"""
+	DFS for topological sorting.
+	"""
+	
+	node.visited = true
+	
+	# Visit dependencies first
+	for dep_id in node.dependencies:
+		if graph.has(dep_id):
+			var dep_node: DepNode = graph[dep_id]
+			if not dep_node.visited:
+				_dfs_topological(dep_node, graph, sorted, visited)
+	
+	# Add to sorted list after all dependencies
+	sorted.append(node.mod_id)
+
+
+## ============================================================================
+## VERSION CHECKING
+## ============================================================================
+
+func check_version_compatibility(required: String, provided: String) -> bool:
+	"""
+	Check if provided version satisfies required version.
+	Supports simple semver ranges: "1.0.0", ">=1.0.0", "^1.0.0"
+	"""
+	
+	if required == "" or required == "*":
+		return true
+	
+	# Exact match
+	if not required.contains(">") and not required.contains("<") and not required.contains("^"):
+		return provided == required
+	
+	# Greater than or equal
+	if required.begins_with(">="):
+		var min_version = required.substr(2).strip_edges()
+		return _compare_versions(provided, min_version) >= 0
+	
+	# Caret (compatible with)
+	if required.begins_with("^"):
+		var base_version = required.substr(1).strip_edges()
+		return _is_compatible_version(provided, base_version)
+	
+	# Default: exact match
+	return provided == required
+
+
+func _compare_versions(a: String, b: String) -> int:
+	"""
+	Compare two version strings.
+	Returns: -1 if a < b, 0 if a == b, 1 if a > b
+	"""
+	
+	var a_parts = a.split(".")
+	var b_parts = b.split(".")
+	
+	var max_len = max(a_parts.size(), b_parts.size())
+	
+	for i in range(max_len):
+		var a_num = int(a_parts[i]) if i < a_parts.size() else 0
+		var b_num = int(b_parts[i]) if i < b_parts.size() else 0
+		
+		if a_num < b_num:
+			return -1
+		elif a_num > b_num:
+			return 1
+	
+	return 0
+
+
+func _is_compatible_version(provided: String, required: String) -> bool:
+	"""
+	Check if provided version is compatible with required (semver ^).
+	^1.2.3 matches 1.x.x where x >= 2
+	"""
+	
+	var provided_parts = provided.split(".")
+	var required_parts = required.split(".")
+	
+	if provided_parts.size() < 1 or required_parts.size() < 1:
+		return false
+	
+	# Major version must match
+	if provided_parts[0] != required_parts[0]:
+		return false
+	
+	# Provided must be >= required
+	return _compare_versions(provided, required) >= 0
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func format_resolution_result(result: ResolutionResult) -> String:
+	"""
+	Format resolution result for logging.
+	"""
+	
+	var output = ""
+	output += "═══════════════════════════════════════\n"
+	output += "   DEPENDENCY RESOLUTION RESULT\n"
+	output += "═══════════════════════════════════════\n"
+	output += "Success:  %s\n" % str(result.is_successful())
+	output += "Errors:   %d\n" % result.errors.size()
+	output += "Warnings: %d\n" % result.warnings.size()
+	output += "\n"
+	
+	if not result.errors.is_empty():
+		output += "ERRORS:\n"
+		for error in result.errors:
+			output += "  ✗ %s\n" % error
+		output += "\n"
+	
+	if not result.warnings.is_empty():
+		output += "WARNINGS:\n"
+		for warning in result.warnings:
+			output += "  ⚠ %s\n" % warning
+		output += "\n"
+	
+	if result.is_successful() and not result.load_order.is_empty():
+		output += "LOAD ORDER:\n"
+		for i in range(result.load_order.size()):
+			output += "  %d. %s\n" % [i + 1, result.load_order[i]]
+	
+	output += "═══════════════════════════════════════\n"
+	
+	return output
+
+
+res://axiom-runtime-/core/modding/DependencyResolver.gd.uid
+
+## DependencyResolver.gd.uid
+## Directory: /axiom-runtime-/core/modding/DependencyResolver.gd.uid
+##
+
+uid://cwr1jhkjerfa7
+
+

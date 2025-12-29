@@ -1,0 +1,1474 @@
+res://axiom-runtime-/core/modding/ModLoader.gd
+
+## ModLoader.gd
+## Directory: /axiom-runtime-/core/modding/ModLoader.gd
+##
+
+## ModLoader.gd
+## Phase 6: Fully integrated with Contract System
+## Directory: /core/modding/ModLoader.gd
+##
+## CRITICAL: Now tracks ALL contract-related capabilities
+## Automatic capability revocation on mod unload
+## Full integration with Phase 6 contract system
+
+extends Node
+
+# Preload contract scripts so identifiers are declared
+const SystemContract = preload("res://core/contracts/SystemContract.gd")
+const UIContract = preload("res://core/contracts/UIContract.gd")
+const SaveHookContract = preload("res://core/contracts/SaveHookContract.gd")
+
+
+const VERSION = "1.1.0-Phase6"  # Updated for Phase 6
+
+## CRITICAL MOD LIFECYCLE RULES:
+## - Mods MUST use Godot's _ready() for initialization (called automatically)
+## - Mods MUST use _exit_tree() for cleanup (called automatically)
+## - Core NEVER calls mod-specific methods
+## - All interaction via capabilities and event handles only
+## - Core only manages scene tree lifecycle, nothing more
+
+enum ModState {
+	UNLOADED,
+	LOADING,
+	LOADED,
+	FAILED,
+	DISABLED,
+	UNLOADING
+}
+
+class ModHandle:
+	var _id: int
+	var _mod_id: String
+	var _is_valid: bool = true
+	
+	func _init(id: int, mod_id: String):
+		_id = id
+		_mod_id = mod_id
+	
+	func invalidate() -> void:
+		_is_valid = false
+	
+	func is_valid() -> bool:
+		return _is_valid
+	
+	func get_mod_id() -> String:
+		return _mod_id
+	
+	func get_handle_id() -> int:
+		return _id
+
+class LoadedMod:
+	var mod_id: String
+	var mod_path: String
+	var state: ModState
+	var script_instance: Node
+	var metadata: Dictionary
+	var validated_metadata: MetadataParser.ValidationResult
+	var dependencies: Array[String]
+	var load_order: int
+	var error_message: String
+	
+	# PHASE 6: Enhanced capability tracking
+	var event_handles: Array = []
+	var registry_handles: Array = []
+	var vfs_handles: Array = []
+	var system_overrides: Array[String] = []      # NEW: Track system overrides
+	var ui_replacements: Array[String] = []       # NEW: Track UI replacements
+	var ui_extensions: Array[String] = []         # NEW: Track UI extensions
+	var save_hook_registrations: Array[String] = [] # NEW: Track save hooks
+	var capability_grants: Array[String] = []     # NEW: Track capability grants
+	var coremod_log_registered: bool = false
+	
+	func _init(id: String, path: String, meta: Dictionary):
+		mod_id = id
+		mod_path = path
+		metadata = meta
+		state = ModState.UNLOADED
+		dependencies = []
+		load_order = -1
+		error_message = ""
+
+## Internal state
+var _loaded_mods: Dictionary = {}
+var _mod_handles: Dictionary = {}
+var _next_handle_id: int = 1
+var _load_order_counter: int = 0
+
+var _mod_search_paths: Array[String] = []
+
+var _total_mods_loaded: int = 0
+var _total_mods_failed: int = 0
+var _total_hot_reloads: int = 0
+
+var _loader_lock: Mutex = Mutex.new()
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	_configure_search_paths()
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Phase 6 contract integration active")
+
+
+func _configure_search_paths() -> void:
+	if PermissionManager.has_storage_permission():
+		var primary_path = PermissionManager.get_saf_folder_path()
+		if primary_path != "":
+			_mod_search_paths.append(primary_path + "/Mods")
+	
+	var fallback_path = PermissionManager.get_fallback_storage_path()
+	_mod_search_paths.append(fallback_path + "/Mods")
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Mod search paths configured:")
+	for path in _mod_search_paths:
+		LoggingService.info(LoggingService.Context.CORE, "ModLoader", "  - %s" % path)
+
+
+## ============================================================================
+## MOD DISCOVERY (Phase 5 Enhanced)
+## ============================================================================
+
+func discover_mods() -> Array[Dictionary]:
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Starting mod discovery...")
+	
+	var discovered_mods: Array[Dictionary] = []
+	
+	for search_path in _mod_search_paths:
+		if not DirAccess.dir_exists_absolute(search_path):
+			LoggingService.debug(LoggingService.Context.CORE, "ModLoader", "Search path does not exist: %s" % search_path)
+			continue
+		
+		var mods_in_path = _scan_directory_for_mods(search_path)
+		discovered_mods.append_array(mods_in_path)
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "✓ Discovered %d mods" % discovered_mods.size())
+	
+	return discovered_mods
+
+
+func _scan_directory_for_mods(dir_path: String) -> Array[Dictionary]:
+	var mods: Array[Dictionary] = []
+	var dir = DirAccess.open(dir_path)
+	if not dir:
+		return mods
+	
+	dir.list_dir_begin()
+	var entry = dir.get_next()
+	
+	while entry != "":
+		if dir.current_is_dir() and not entry.begins_with("."):
+			var mod_path = dir_path.path_join(entry)
+			
+			var metadata_file = mod_path.path_join("mod.yaml")
+			if not FileAccess.file_exists(metadata_file):
+				metadata_file = mod_path.path_join("mod.json")
+			
+			if FileAccess.file_exists(metadata_file):
+				var metadata = _load_mod_metadata(metadata_file)
+				if metadata.size() > 0:
+					metadata["_path"] = mod_path
+					metadata["_metadata_file"] = metadata_file
+					mods.append(metadata)
+					LoggingService.debug(LoggingService.Context.CORE, "ModLoader", "Found mod: %s" % metadata.get("id", "unknown"))
+		
+		entry = dir.get_next()
+	
+	dir.list_dir_end()
+	
+	return mods
+
+
+func _load_mod_metadata(metadata_path: String) -> Dictionary:
+	if metadata_path.ends_with(".yaml"):
+		var validation_result = MetadataParser.parse_mod_metadata(metadata_path)
+		
+		if validation_result.is_valid():
+			return validation_result.parsed_data
+		else:
+			LoggingService.error(LoggingService.Context.CORE, "ModLoader", "Invalid metadata: %s" % metadata_path)
+			for error in validation_result.errors:
+				LoggingService.error(LoggingService.Context.CORE, "ModLoader", "  - %s" % error)
+			return {}
+	
+	var file = FileAccess.open(metadata_path, FileAccess.READ)
+	if not file:
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "Cannot read metadata: %s" % metadata_path)
+		return {}
+	
+	var json_text = file.get_as_text()
+	file.close()
+	
+	var json = JSON.new()
+	var parse_result = json.parse(json_text)
+	
+	if parse_result != OK:
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "Invalid JSON in: %s" % metadata_path)
+		return {}
+	
+	var metadata = json.get_data()
+	
+	if not metadata.has("id"):
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "Missing 'id' in metadata: %s" % metadata_path)
+		return {}
+	
+	if not metadata.has("version"):
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "Missing 'version' in metadata: %s" % metadata_path)
+		return {}
+	
+	return metadata
+
+
+## ============================================================================
+## MOD LOADING (Phase 6 Enhanced)
+## ============================================================================
+
+func load_mod(mod_id: String, metadata: Dictionary) -> ModHandle:
+	_loader_lock.lock()
+	
+	if _loaded_mods.has(mod_id):
+		_loader_lock.unlock()
+		LoggingService.warn(LoggingService.Context.CORE, "ModLoader", "Mod '%s' already loaded" % mod_id)
+		return _get_handle_for_mod(mod_id)
+	
+	var mod_path = metadata.get("_path", "")
+	if mod_path == "":
+		_loader_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "No path provided for mod: %s" % mod_id)
+		return null
+	
+	var mod_record = LoadedMod.new(mod_id, mod_path, metadata)
+	mod_record.state = ModState.LOADING
+	_loaded_mods[mod_id] = mod_record
+	
+	_loader_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Loading mod: %s v%s" % [mod_id, metadata.get("version", "unknown")])
+	
+	# Phase 5: Validate metadata if YAML
+	var metadata_file = metadata.get("_metadata_file", "")
+	if metadata_file.ends_with(".yaml"):
+		var validation_result = MetadataParser.parse_mod_metadata(metadata_file)
+		mod_record.validated_metadata = validation_result
+		
+		if not validation_result.is_valid():
+			mod_record.state = ModState.FAILED
+			mod_record.error_message = "Metadata validation failed"
+			_total_mods_failed += 1
+			LoggingService.error(LoggingService.Context.CORE, "ModLoader", "✗ Metadata validation failed for: %s" % mod_id)
+			return null
+	
+	# Load mod script
+	var success = _load_mod_script(mod_record)
+	
+	if success:
+		mod_record.state = ModState.LOADED
+		mod_record.load_order = _load_order_counter
+		_load_order_counter += 1
+		_total_mods_loaded += 1
+		
+		LoggingService.info(LoggingService.Context.CORE, "ModLoader", "✓ Loaded mod: %s (order: %d)" % [mod_id, mod_record.load_order])
+	else:
+		mod_record.state = ModState.FAILED
+		_total_mods_failed += 1
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "✗ Failed to load mod: %s - %s" % [mod_id, mod_record.error_message])
+	
+	var handle = ModHandle.new(_next_handle_id, mod_id)
+	_next_handle_id += 1
+	_mod_handles[handle.get_handle_id()] = handle
+	
+	return handle
+
+
+func _load_mod_script(mod_record: LoadedMod) -> bool:
+	var main_script_path = mod_record.metadata.get("main", "mod.gd")
+	var full_script_path = mod_record.mod_path.path_join(main_script_path)
+	
+	if not FileAccess.file_exists(full_script_path):
+		mod_record.error_message = "Main script not found: %s" % main_script_path
+		return false
+	
+	var script = load(full_script_path)
+	if not script:
+		mod_record.error_message = "Failed to load script: %s" % main_script_path
+		return false
+	
+	var instance = script.new()
+	if not instance:
+		mod_record.error_message = "Failed to instantiate script"
+		return false
+	
+	add_child(instance)
+	mod_record.script_instance = instance
+	
+	var log_path = LoggingService.register_coremod_log(mod_record.mod_id)
+	if log_path != "":
+		mod_record.coremod_log_registered = true
+	
+	LoggingService.debug(LoggingService.Context.CORE, "ModLoader", "Mod added to scene tree, _ready() will be called by Godot")
+	
+	return true
+
+
+## ============================================================================
+## MOD UNLOADING (Phase 6 Enhanced - Full Capability Revocation)
+## ============================================================================
+
+func unload_mod(handle: ModHandle) -> bool:
+	if handle == null or not handle.is_valid():
+		LoggingService.warn(LoggingService.Context.CORE, "ModLoader", "Invalid handle for unload")
+		return false
+	
+	_loader_lock.lock()
+	
+	var mod_id = handle.get_mod_id()
+	
+	if not _loaded_mods.has(mod_id):
+		_loader_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "Mod not loaded: %s" % mod_id)
+		return false
+	
+	var mod_record: LoadedMod = _loaded_mods[mod_id]
+	mod_record.state = ModState.UNLOADING
+	
+	_loader_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Unloading mod: %s" % mod_id)
+	
+	# PHASE 6: Revoke ALL capabilities
+	_revoke_all_capabilities_phase6(mod_record)
+	
+	# Remove from scene tree
+	if mod_record.script_instance:
+		remove_child(mod_record.script_instance)
+		mod_record.script_instance.queue_free()
+		mod_record.script_instance = null
+	
+	LoggingService.debug(LoggingService.Context.CORE, "ModLoader", "Mod removed from scene tree, _exit_tree() called by Godot")
+	
+	# Unregister log
+	if mod_record.coremod_log_registered:
+		LoggingService.unregister_coremod_log(mod_id)
+		mod_record.coremod_log_registered = false
+	
+	# Remove from loaded mods
+	_loader_lock.lock()
+	mod_record.state = ModState.UNLOADED
+	_loaded_mods.erase(mod_id)
+	handle.invalidate()
+	_mod_handles.erase(handle.get_handle_id())
+	_loader_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "✓ Unloaded mod: %s" % mod_id)
+	
+	return true
+
+
+func _revoke_all_capabilities_phase6(mod_record: LoadedMod) -> void:
+	"""
+	PHASE 6: Comprehensive capability revocation.
+	Revokes all contracts, overrides, and capabilities.
+	"""
+	
+	LoggingService.debug(LoggingService.Context.CORE, "ModLoader", "Revoking Phase 6 capabilities for: %s" % mod_record.mod_id)
+	
+	var total_revoked = 0
+	var failed_revocations = 0
+	
+	# 1. Revoke event subscriptions
+	for event_handle in mod_record.event_handles:
+		EventBus.unsubscribe(event_handle)
+		if event_handle.is_valid():
+			failed_revocations += 1
+		else:
+			total_revoked += 1
+	mod_record.event_handles.clear()
+	
+	# 2. Revoke registry handles
+	for registry_handle in mod_record.registry_handles:
+		RegistryManager.destroy_registry(registry_handle)
+		if registry_handle.is_valid():
+			failed_revocations += 1
+		else:
+			total_revoked += 1
+	mod_record.registry_handles.clear()
+	
+	# 3. Revoke VFS mounts
+	for vfs_handle in mod_record.vfs_handles:
+		VirtualFileSystem.unmount(vfs_handle)
+		if vfs_handle.is_valid():
+			failed_revocations += 1
+		else:
+			total_revoked += 1
+	mod_record.vfs_handles.clear()
+	
+	# 4. NEW: Remove system overrides
+	var system_override_count = SystemContract.remove_all_overrides_for_mod(mod_record.mod_id)
+	total_revoked += system_override_count
+	mod_record.system_overrides.clear()
+	
+	# 5. NEW: Remove UI replacements
+	var ui_replacement_count = UIContract.remove_all_replacements_for_mod(mod_record.mod_id)
+	total_revoked += ui_replacement_count
+	mod_record.ui_replacements.clear()
+	
+	# 6. NEW: Remove UI extensions
+	var ui_extension_count = UIContract.remove_all_extensions_for_mod(mod_record.mod_id)
+	total_revoked += ui_extension_count
+	mod_record.ui_extensions.clear()
+	
+	# 7. NEW: Unregister save hooks
+	var save_hook_count = SaveHookContract.unregister_all_hooks_for_mod(mod_record.mod_id)
+	total_revoked += save_hook_count
+	mod_record.save_hook_registrations.clear()
+	
+	# 8. NEW: Revoke capability grants
+	var capability_count = CapabilityGrant.revoke_all_for_mod(mod_record.mod_id)
+	total_revoked += capability_count
+	mod_record.capability_grants.clear()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "✓ Phase 6 capabilities revoked: %d (failed: %d)" % [total_revoked, failed_revocations])
+	
+	if failed_revocations > 0:
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "⚠ %d handles failed invalidation - potential memory leak" % failed_revocations)
+
+
+## ============================================================================
+## HOT-RELOAD
+## ============================================================================
+
+func hot_reload_mod(handle: ModHandle) -> bool:
+	if handle == null or not handle.is_valid():
+		return false
+	
+	var mod_id = handle.get_mod_id()
+	
+	if not _loaded_mods.has(mod_id):
+		return false
+	
+	var mod_record: LoadedMod = _loaded_mods[mod_id]
+	var metadata = mod_record.metadata.duplicate()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "Hot-reloading mod: %s" % mod_id)
+	
+	if not unload_mod(handle):
+		return false
+	
+	var new_handle = load_mod(mod_id, metadata)
+	
+	if new_handle and new_handle.is_valid():
+		_total_hot_reloads += 1
+		LoggingService.info(LoggingService.Context.CORE, "ModLoader", "✓ Hot-reload successful: %s" % mod_id)
+		return true
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "ModLoader", "✗ Hot-reload failed: %s" % mod_id)
+		return false
+
+
+## ============================================================================
+## CAPABILITY TRACKING (Phase 6 Enhanced)
+## ============================================================================
+
+func track_event_handle(mod_id: String, event_handle) -> void:
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].event_handles.append(event_handle)
+
+
+func track_registry_handle(mod_id: String, registry_handle) -> void:
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].registry_handles.append(registry_handle)
+
+
+func track_vfs_handle(mod_id: String, vfs_handle) -> void:
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].vfs_handles.append(vfs_handle)
+
+
+func track_system_override(mod_id: String, system_id: String) -> void:
+	"""NEW: Track system override for cleanup"""
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].system_overrides.append(system_id)
+
+
+func track_ui_replacement(mod_id: String, ui_id: String) -> void:
+	"""NEW: Track UI replacement for cleanup"""
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].ui_replacements.append(ui_id)
+
+
+func track_ui_extension(mod_id: String, extension_id: String) -> void:
+	"""NEW: Track UI extension for cleanup"""
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].ui_extensions.append(extension_id)
+
+
+func track_save_hook(mod_id: String, hook_id: String) -> void:
+	"""NEW: Track save hook registration for cleanup"""
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].save_hook_registrations.append(hook_id)
+
+
+func track_capability_grant(mod_id: String, capability_id: String) -> void:
+	"""NEW: Track capability grant for cleanup"""
+	if _loaded_mods.has(mod_id):
+		_loaded_mods[mod_id].capability_grants.append(capability_id)
+
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func is_mod_loaded(mod_id: String) -> bool:
+	return _loaded_mods.has(mod_id) and _loaded_mods[mod_id].state == ModState.LOADED
+
+
+func get_mod_state(mod_id: String) -> ModState:
+	if _loaded_mods.has(mod_id):
+		return _loaded_mods[mod_id].state
+	return ModState.UNLOADED
+
+
+func get_loaded_mod_ids() -> Array[String]:
+	var ids: Array[String] = []
+	for mod_id in _loaded_mods.keys():
+		if _loaded_mods[mod_id].state == ModState.LOADED:
+			ids.append(mod_id)
+	return ids
+
+
+func get_mod_metadata(mod_id: String) -> Dictionary:
+	if _loaded_mods.has(mod_id):
+		return _loaded_mods[mod_id].metadata.duplicate()
+	return {}
+
+
+func _get_handle_for_mod(mod_id: String) -> ModHandle:
+	for handle in _mod_handles.values():
+		if handle.get_mod_id() == mod_id and handle.is_valid():
+			return handle
+	return null
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_statistics() -> String:
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   MOD LOADER STATISTICS (Phase 6)\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Version:              %s\n" % VERSION
+	stats += "Loaded Mods:          %d\n" % _loaded_mods.size()
+	stats += "Total Loads:          %d\n" % _total_mods_loaded
+	stats += "Total Failures:       %d\n" % _total_mods_failed
+	stats += "Hot Reloads:          %d\n" % _total_hot_reloads
+	stats += "Active Handles:       %d\n" % _mod_handles.size()
+	stats += "═══════════════════════════════════════\n"
+	
+	if not _loaded_mods.is_empty():
+		stats += "Loaded Mods:\n"
+		for mod_id in _loaded_mods.keys():
+			var mod_record: LoadedMod = _loaded_mods[mod_id]
+			var state_str = ModState.keys()[mod_record.state]
+			stats += "  %s: %s (order: %d)\n" % [mod_id, state_str, mod_record.load_order]
+			
+			# Show capability counts
+			var cap_count = 0
+			cap_count += mod_record.event_handles.size()
+			cap_count += mod_record.system_overrides.size()
+			cap_count += mod_record.ui_replacements.size()
+			cap_count += mod_record.ui_extensions.size()
+			cap_count += mod_record.save_hook_registrations.size()
+			cap_count += mod_record.capability_grants.size()
+			
+			if cap_count > 0:
+				stats += "    Capabilities: %d\n" % cap_count
+	
+	return stats
+
+
+## ============================================================================
+## SHUTDOWN
+## ============================================================================
+
+func shutdown() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "   SHUTTING DOWN (Phase 6)")
+	LoggingService.info(LoggingService.Context.CORE, "ModLoader", "═══════════════════════════════════════")
+	
+	var stats = get_statistics()
+	for line in stats.split("\n"):
+		if line.strip_edges() != "":
+			LoggingService.info(LoggingService.Context.CORE, "ModLoader", line)
+	
+	var handles_to_unload: Array[ModHandle] = []
+	for handle in _mod_handles.values():
+		if handle.is_valid():
+			handles_to_unload.append(handle)
+	
+	for handle in handles_to_unload:
+		unload_mod(handle)
+	
+	_loaded_mods.clear()
+	_mod_handles.clear()
+
+
+res://axiom-runtime-/core/modding/ModLoader.gd.uid
+
+## ModLoader.gd.uid
+## Directory: /axiom-runtime-/core/modding/ModLoader.gd.uid
+##
+
+uid://bqyubjdk821t2
+
+
+res://axiom-runtime-/core/permissions/PermissionManager.gd
+
+## PermissionManager.gd
+## Directory: /axiom-runtime-/core/permissions/PermissionManager.gd
+##
+
+## PermissionManager.gd
+## Phase 1: Foundation - Android SAF-based permission handling
+## Directory: /core/permissions/PermissionManager.gd
+##
+## CRITICAL: Uses Android Storage Access Framework (SAF) instead of MANAGE_EXTERNAL_STORAGE
+## Provides permission status checks and persistence
+
+extends Node
+
+signal permission_granted(folder_path: String)
+signal permission_denied
+signal saf_picker_shown
+
+const PREFS_FILE = "user://permission_state.cfg"
+const PREFS_SECTION = "permissions"
+const KEY_SAF_GRANTED = "saf_folder_granted"
+const KEY_SAF_PATH = "saf_folder_path"
+
+var _config: ConfigFile = ConfigFile.new()
+var _has_permission: bool = false
+var _saf_folder_path: String = ""
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	_load_persisted_state()
+	
+	LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "Initialized")
+	LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "SAF granted: %s" % str(_has_permission))
+	
+	if _has_permission and _saf_folder_path != "":
+		LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "SAF path: %s" % _saf_folder_path)
+
+
+## ============================================================================
+## SAF PERMISSION FLOW
+## ============================================================================
+
+func check_storage_permission() -> bool:
+	"""
+	Checks if we have storage access via SAF.
+	On Android, this returns true if SAF folder was previously granted.
+	On other platforms, always returns true.
+	"""
+	
+	if OS.get_name() != "Android":
+		_has_permission = true
+		LoggingService.debug(LoggingService.Context.CORE, "PermissionManager", "Non-Android platform - permission granted by default")
+		return true
+	
+	LoggingService.debug(LoggingService.Context.CORE, "PermissionManager", "Checking SAF permission status...")
+	
+	# Check persisted state
+	if _has_permission and _saf_folder_path != "":
+		LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "✓ SAF permission already granted")
+		return true
+	
+	LoggingService.warn(LoggingService.Context.CORE, "PermissionManager", "SAF permission not granted - using fallback storage")
+	return false
+
+
+func request_saf_folder_access() -> void:
+	"""
+	Requests SAF folder access from the user.
+	This would trigger Android's folder picker UI.
+	"""
+	
+	if OS.get_name() != "Android":
+		LoggingService.debug(LoggingService.Context.CORE, "PermissionManager", "SAF not needed on non-Android")
+		return
+	
+	LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "Requesting SAF folder access...")
+	
+	# TODO: Phase 2 - Implement JNI bridge for Android SAF
+	# This would call:
+	# Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+	# startActivityForResult(intent, SAF_REQUEST_CODE);
+	
+	# For Phase 1, we simulate the flow
+	_simulate_saf_request()
+
+
+func _simulate_saf_request() -> void:
+	"""
+	Simulates SAF flow for Phase 1 testing.
+	In Phase 2, this will be replaced with actual JNI bridge.
+	"""
+	
+	LoggingService.warn(LoggingService.Context.CORE, "PermissionManager", "SAF simulation mode - no actual picker shown")
+	saf_picker_shown.emit()
+	
+	# Auto-grant for testing purposes
+	# In production, this would be handled by Android callback
+	var simulated_path = "/storage/emulated/0/AxiomRuntime"
+	on_saf_folder_selected(simulated_path)
+
+
+func on_saf_folder_selected(folder_uri: String) -> void:
+	"""
+	Called when user grants SAF access to a folder.
+	In Phase 2, this will be called from JNI bridge.
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "SAF folder selected: %s" % folder_uri)
+	
+	# Validate path
+	if not _validate_saf_path(folder_uri):
+		LoggingService.error(LoggingService.Context.CORE, "PermissionManager", "Invalid SAF path - cannot use")
+		on_saf_folder_denied()
+		return
+	
+	_has_permission = true
+	_saf_folder_path = folder_uri
+	
+	# Persist state
+	_config.set_value(PREFS_SECTION, KEY_SAF_GRANTED, true)
+	_config.set_value(PREFS_SECTION, KEY_SAF_PATH, folder_uri)
+	var err = _config.save(PREFS_FILE)
+	
+	if err == OK:
+		LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "✓ SAF permission persisted")
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "PermissionManager", "Failed to persist SAF permission: %d" % err)
+	
+	permission_granted.emit(folder_uri)
+	
+	# Notify LoggingService to switch to primary path
+	if LoggingService.switch_to_primary_path(folder_uri):
+		LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "✓ Logging switched to primary path")
+
+
+func on_saf_folder_denied() -> void:
+	"""
+	Called when user denies SAF folder access.
+	"""
+	
+	LoggingService.warn(LoggingService.Context.CORE, "PermissionManager", "SAF folder access denied by user")
+	
+	_has_permission = false
+	_saf_folder_path = ""
+	
+	# Persist denial
+	_config.set_value(PREFS_SECTION, KEY_SAF_GRANTED, false)
+	_config.set_value(PREFS_SECTION, KEY_SAF_PATH, "")
+	_config.save(PREFS_FILE)
+	
+	permission_denied.emit()
+
+
+func _validate_saf_path(path: String) -> bool:
+	"""
+	Validates that the SAF path is usable.
+	"""
+	
+	if path == "":
+		return false
+	
+	# Attempt to create a test file
+	var test_dir = path + "/test"
+	var dir = DirAccess.open("/")
+	if not dir:
+		return false
+	
+	var err = dir.make_dir_recursive(test_dir)
+	if err != OK and not DirAccess.dir_exists_absolute(test_dir):
+		LoggingService.error(LoggingService.Context.CORE, "PermissionManager", "Cannot create directories in SAF path")
+		return false
+	
+	# Try to write a test file
+	var test_file = test_dir + "/write_test.txt"
+	var file = FileAccess.open(test_file, FileAccess.WRITE)
+	if not file:
+		LoggingService.error(LoggingService.Context.CORE, "PermissionManager", "Cannot write to SAF path")
+		return false
+	
+	file.store_string("Axiom Runtime write test")
+	file.close()
+	
+	# Clean up test
+	DirAccess.remove_absolute(test_file)
+	dir.remove(test_dir)
+	
+	return true
+
+
+## ============================================================================
+## PERMISSION STATE PERSISTENCE
+## ============================================================================
+
+func _load_persisted_state() -> void:
+	var err = _config.load(PREFS_FILE)
+	
+	if err == OK:
+		_has_permission = _config.get_value(PREFS_SECTION, KEY_SAF_GRANTED, false)
+		_saf_folder_path = _config.get_value(PREFS_SECTION, KEY_SAF_PATH, "")
+		
+		LoggingService.debug(LoggingService.Context.CORE, "PermissionManager", "Loaded persisted permission state")
+	else:
+		_has_permission = false
+		_saf_folder_path = ""
+		LoggingService.debug(LoggingService.Context.CORE, "PermissionManager", "No persisted permission state found")
+
+
+func clear_persisted_permission() -> void:
+	"""
+	Clears persisted SAF permission.
+	User will need to re-grant access on next launch.
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "PermissionManager", "Clearing persisted SAF permission")
+	
+	_has_permission = false
+	_saf_folder_path = ""
+	
+	_config.set_value(PREFS_SECTION, KEY_SAF_GRANTED, false)
+	_config.set_value(PREFS_SECTION, KEY_SAF_PATH, "")
+	_config.save(PREFS_FILE)
+
+
+## ============================================================================
+## PUBLIC API
+## ============================================================================
+
+func has_storage_permission() -> bool:
+	return _has_permission
+
+
+func get_saf_folder_path() -> String:
+	return _saf_folder_path
+
+
+func is_permission_persisted() -> bool:
+	return _config.has_section_key(PREFS_SECTION, KEY_SAF_GRANTED)
+
+
+func should_show_permission_screen() -> bool:
+	"""
+	Returns true if we should show the SAF permission screen.
+	True when permission not granted and not previously denied.
+	"""
+	return not _has_permission
+
+
+func get_permission_status_text() -> String:
+	if _has_permission:
+		return "Storage permission: GRANTED via SAF"
+	else:
+		return "Storage permission: NOT GRANTED (using fallback storage)"
+
+
+func get_primary_storage_path() -> String:
+	if _has_permission and _saf_folder_path != "":
+		return _saf_folder_path
+	else:
+		return "/storage/emulated/0/AxiomRuntime"
+
+
+func get_fallback_storage_path() -> String:
+	return "/storage/emulated/0/Android/data/com.axiom.runtime/AxiomRuntime"
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_permission_diagnostics() -> String:
+	var diag = ""
+	diag += "═══════════════════════════════════════\n"
+	diag += "   PERMISSION STATUS\n"
+	diag += "═══════════════════════════════════════\n"
+	diag += "Platform:        %s\n" % OS.get_name()
+	diag += "SAF Granted:     %s\n" % str(_has_permission)
+	diag += "SAF Path:        %s\n" % (_saf_folder_path if _saf_folder_path != "" else "(none)")
+	diag += "Primary Path:    %s\n" % get_primary_storage_path()
+	diag += "Fallback Path:   %s\n" % get_fallback_storage_path()
+	diag += "═══════════════════════════════════════\n"
+	
+	return diag
+
+
+res://axiom-runtime-/core/permissions/PermissionManager.gd.uid
+
+## PermissionManager.gd.uid
+## Directory: /axiom-runtime-/core/permissions/PermissionManager.gd.uid
+##
+
+uid://dgiv3lebfgi0g
+
+
+res://axiom-runtime-/core/services/EventBus.gd
+
+## EventBus.gd
+## Directory: /axiom-runtime-/core/services/EventBus.gd
+##
+
+## EventBus.gd
+## Phase 6: Integrated with Contract System
+## Directory: /core/services/EventBus.gd
+##
+## CRITICAL: Core never interprets event semantics
+## Events are opaque payloads routed by ID only
+## PHASE 6: Now validates event contracts before subscription
+## IMPROVED: Thread safety + rate limiting
+
+extends Node
+
+const VERSION = "1.0.3-Phase6-Improved"  # Updated for improvements
+
+signal callback_failed(event_name: String, subscriber_id: String, error_message: String)
+
+class EventHandle:
+	var _id: int
+	var _event_name: String
+	var _callback: Callable
+	var _subscriber_id: String
+	var _is_valid: bool = true
+	
+	func _init(id: int, event_name: String, callback: Callable, subscriber_id: String):
+		_id = id
+		_event_name = event_name
+		_callback = callback
+		_subscriber_id = subscriber_id
+	
+	func invalidate() -> void:
+		_is_valid = false
+		_callback = Callable()
+	
+	func is_valid() -> bool:
+		return _is_valid
+	
+	func get_event_name() -> String:
+		return _event_name
+	
+	func get_subscriber_id() -> String:
+		return _subscriber_id
+	
+	func get_handle_id() -> int:
+		return _id
+
+## Internal state
+var _subscriptions: Dictionary = {}
+var _next_handle_id: int = 1
+var _active_handles: Dictionary = {}
+var _event_stats: Dictionary = {}
+
+var _total_events_emitted: int = 0
+var _total_subscriptions: int = 0
+var _total_callback_failures: int = 0
+
+var _subscription_lock: Mutex = Mutex.new()
+
+## PHASE 6: Contract validation mode
+var _contract_validation_enabled: bool = false
+
+## IMPROVEMENT: Rate limiting
+var _emission_rate_limit: Dictionary = {}  # {event_name: [timestamp, count]}
+var _rate_limit_enabled: bool = false
+var _rate_limit_window_ms: int = 1000
+var _rate_limit_max_per_window: int = 1000
+var _total_rate_limited: int = 0
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "Semantic-free event routing ready")
+	
+	# Load rate limit config from StartupConfig if available
+	_load_rate_limit_config()
+	
+	# Phase 6: Enable contract validation after ContractRegistry is ready
+	await get_tree().process_frame
+	if ContractRegistry:
+		_contract_validation_enabled = true
+		LoggingService.info(LoggingService.Context.CORE, "EventBus", "Phase 6 contract validation enabled")
+
+
+func _load_rate_limit_config() -> void:
+	"""Load rate limiting configuration from StartupConfig"""
+	if not has_node("/root/StartupConfig"):
+		return
+	
+	var config = get_node("/root/StartupConfig")
+	_rate_limit_enabled = config.is_rate_limiting_enabled()
+	_rate_limit_window_ms = config.get_rate_limit_window_ms()
+	_rate_limit_max_per_window = config.get_rate_limit_max_per_window()
+	
+	if _rate_limit_enabled:
+		LoggingService.info(LoggingService.Context.CORE, "EventBus", "Rate limiting enabled: %d events per %dms" % [_rate_limit_max_per_window, _rate_limit_window_ms])
+
+
+## ============================================================================
+## SUBSCRIPTION API (Phase 6 Enhanced)
+## ============================================================================
+
+func subscribe(event_name: String, callback: Callable, subscriber_id: String = "") -> EventHandle:
+	"""
+	Subscribe to an event. Returns an opaque handle for cleanup.
+	
+	PHASE 6: Now optionally validates event contract exists.
+	
+	Args:
+		event_name: The event identifier (opaque to Core)
+		callback: Function to call when event fires (must accept 1 parameter: payload)
+		subscriber_id: Optional identifier for diagnostics (e.g., "mod_id" or "system_name")
+	
+	Returns:
+		EventHandle that must be stored for later unsubscribe
+	"""
+	
+	if not callback.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "EventBus", "Invalid callback for event: %s" % event_name)
+		return null
+	
+	# PHASE 6: Optional contract validation
+	if _contract_validation_enabled:
+		if not _validate_event_contract(event_name):
+			LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Event '%s' has no registered contract (subscription allowed but unverified)" % event_name)
+	
+	_subscription_lock.lock()
+	
+	var handle = EventHandle.new(_next_handle_id, event_name, callback, subscriber_id)
+	_next_handle_id += 1
+	
+	if not _subscriptions.has(event_name):
+		_subscriptions[event_name] = []
+		_event_stats[event_name] = {"emitted": 0, "subscribers": 0, "failures": 0}
+	
+	_subscriptions[event_name].append(handle)
+	_active_handles[handle.get_handle_id()] = handle
+	_total_subscriptions += 1
+	_event_stats[event_name]["subscribers"] += 1
+	
+	_subscription_lock.unlock()
+	
+	var sub_info = "subscriber=%s" % subscriber_id if subscriber_id != "" else "anonymous"
+	LoggingService.debug(LoggingService.Context.CORE, "EventBus", "Subscribed to '%s' (%s) [handle=%d]" % [event_name, sub_info, handle.get_handle_id()])
+	
+	return handle
+
+
+func unsubscribe(handle: EventHandle) -> void:
+	"""
+	Unsubscribe from an event using the handle returned from subscribe().
+	This invalidates the handle and removes the subscription.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Attempted to unsubscribe with invalid handle")
+		return
+	
+	_subscription_lock.lock()
+	
+	var event_name = handle.get_event_name()
+	
+	if _subscriptions.has(event_name):
+		_subscriptions[event_name].erase(handle)
+		
+		if _event_stats.has(event_name):
+			_event_stats[event_name]["subscribers"] = max(0, _event_stats[event_name]["subscribers"] - 1)
+		
+		if _subscriptions[event_name].is_empty():
+			_subscriptions.erase(event_name)
+	
+	_active_handles.erase(handle.get_handle_id())
+	handle.invalidate()
+	
+	_subscription_lock.unlock()
+	
+	LoggingService.debug(LoggingService.Context.CORE, "EventBus", "Unsubscribed from '%s' [handle=%d]" % [event_name, handle.get_handle_id()])
+
+
+func unsubscribe_all(subscriber_id: String) -> void:
+	"""
+	Unsubscribe all events for a given subscriber ID.
+	Used during mod unload or system shutdown.
+	"""
+	
+	if subscriber_id == "":
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Cannot unsubscribe_all with empty subscriber_id")
+		return
+	
+	_subscription_lock.lock()
+	
+	var handles_to_remove: Array[EventHandle] = []
+	
+	for handle in _active_handles.values():
+		if handle.get_subscriber_id() == subscriber_id:
+			handles_to_remove.append(handle)
+	
+	_subscription_lock.unlock()
+	
+	for handle in handles_to_remove:
+		unsubscribe(handle)
+	
+	if handles_to_remove.size() > 0:
+		LoggingService.info(LoggingService.Context.CORE, "EventBus", "Unsubscribed %d events for subscriber: %s" % [handles_to_remove.size(), subscriber_id])
+
+
+## ============================================================================
+## EVENT EMISSION (Phase 6 Enhanced + Rate Limiting)
+## ============================================================================
+
+func emit_event(event_name: String, payload: Variant = null) -> void:
+	"""
+	Emit an event with an opaque payload.
+	Core never interprets the payload - it's just routed to subscribers.
+	
+	PHASE 6: Optional contract validation.
+	IMPROVED: Rate limiting to prevent DoS.
+	
+	Args:
+		event_name: The event identifier
+		payload: Arbitrary data (Dictionary, Object, primitive, etc.)
+	"""
+	
+	# IMPROVEMENT: Check rate limit first
+	if _rate_limit_enabled and _check_rate_limit(event_name):
+		_total_rate_limited += 1
+		LoggingService.error(LoggingService.Context.CORE, "EventBus", "Rate limit exceeded for event: %s (dropped)" % event_name)
+		return
+	
+	# PHASE 6: Optional contract validation
+	if _contract_validation_enabled:
+		if not _validate_event_contract(event_name):
+			LoggingService.debug(LoggingService.Context.CORE, "EventBus", "Event '%s' has no registered contract (emission allowed but unverified)" % event_name)
+	
+	_subscription_lock.lock()
+	
+	if not _subscriptions.has(event_name):
+		_subscription_lock.unlock()
+		LoggingService.verbose(LoggingService.Context.CORE, "EventBus", "Event '%s' emitted with no subscribers" % event_name)
+		return
+	
+	var subscribers = _subscriptions[event_name].duplicate()
+	
+	_total_events_emitted += 1
+	if _event_stats.has(event_name):
+		_event_stats[event_name]["emitted"] += 1
+	
+	_subscription_lock.unlock()
+	
+	var delivered_count = 0
+	var failed_count = 0
+	
+	for handle in subscribers:
+		if handle.is_valid():
+			var success = _invoke_callback(handle, payload)
+			if success:
+				delivered_count += 1
+			else:
+				failed_count += 1
+	
+	if failed_count > 0:
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Event '%s' had %d callback failures" % [event_name, failed_count])
+	
+	LoggingService.verbose(LoggingService.Context.CORE, "EventBus", "Event '%s' delivered to %d subscribers (%d failed)" % [event_name, delivered_count, failed_count])
+
+
+func _invoke_callback(handle: EventHandle, payload: Variant) -> bool:
+	"""
+	IMPROVED: Safely invoke callback with enhanced thread safety.
+	Now checks if object is being freed before deferred call.
+	"""
+	
+	if not handle.is_valid():
+		return false
+	
+	var callback = handle._callback
+	var event_name = handle.get_event_name()
+	var subscriber_id = handle.get_subscriber_id()
+	
+	if not callback.is_valid():
+		var error_msg = "Invalid callback"
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Invalid callback for event: %s [handle=%d]" % [event_name, handle.get_handle_id()])
+		
+		_total_callback_failures += 1
+		if _event_stats.has(event_name):
+			_event_stats[event_name]["failures"] += 1
+		
+		callback_failed.emit(event_name, subscriber_id, error_msg)
+		
+		return false
+	
+	var callable_object = callback.get_object()
+	if callable_object == null or not is_instance_valid(callable_object):
+		var error_msg = "Callback object no longer valid"
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Callback object invalid for event: %s [handle=%d]" % [event_name, handle.get_handle_id()])
+		
+		_total_callback_failures += 1
+		if _event_stats.has(event_name):
+			_event_stats[event_name]["failures"] += 1
+		
+		callback_failed.emit(event_name, subscriber_id, error_msg)
+		
+		handle.invalidate()
+		
+		return false
+	
+	# IMPROVEMENT: Check if object is being freed before deferred call
+	if callable_object.is_queued_for_deletion():
+		var error_msg = "Callback object being freed"
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Callback object being freed for event: %s [handle=%d]" % [event_name, handle.get_handle_id()])
+		
+		_total_callback_failures += 1
+		if _event_stats.has(event_name):
+			_event_stats[event_name]["failures"] += 1
+		
+		callback_failed.emit(event_name, subscriber_id, error_msg)
+		
+		handle.invalidate()
+		
+		return false
+	
+	callback.call_deferred(payload)
+	
+	return true
+
+
+## ============================================================================
+## IMPROVEMENT: RATE LIMITING
+## ============================================================================
+
+func _check_rate_limit(event_name: String) -> bool:
+	"""
+	Check if event has exceeded rate limit.
+	Returns true if rate limited (should drop event).
+	"""
+	
+	var now = Time.get_ticks_msec()
+	
+	if not _emission_rate_limit.has(event_name):
+		_emission_rate_limit[event_name] = [now, 1]
+		return false
+	
+	var data = _emission_rate_limit[event_name]
+	var window_start = data[0]
+	var count = data[1]
+	
+	# Check if window has expired
+	if now - window_start > _rate_limit_window_ms:
+		# Reset window
+		_emission_rate_limit[event_name] = [now, 1]
+		return false
+	
+	# Check if limit exceeded
+	if count >= _rate_limit_max_per_window:
+		return true  # Rate limited
+	
+	# Increment count
+	_emission_rate_limit[event_name] = [window_start, count + 1]
+	return false
+
+
+func enable_rate_limiting(enabled: bool) -> void:
+	"""
+	Enable or disable rate limiting at runtime.
+	"""
+	_rate_limit_enabled = enabled
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "Rate limiting %s" % ("enabled" if enabled else "disabled"))
+
+
+func set_rate_limit(window_ms: int, max_per_window: int) -> void:
+	"""
+	Configure rate limiting parameters at runtime.
+	"""
+	_rate_limit_window_ms = window_ms
+	_rate_limit_max_per_window = max_per_window
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "Rate limit updated: %d events per %dms" % [max_per_window, window_ms])
+
+
+## ============================================================================
+## PHASE 6: CONTRACT VALIDATION
+## ============================================================================
+
+func _validate_event_contract(event_name: String) -> bool:
+	"""
+	PHASE 6: Validate that an event contract exists.
+	This is optional - events can be emitted without contracts.
+	"""
+	
+	if not ContractRegistry:
+		return false
+	
+	return ContractRegistry.has_contract(event_name)
+
+
+func enable_contract_validation(enabled: bool) -> void:
+	"""
+	PHASE 6: Enable or disable contract validation.
+	By default, validation is enabled after ContractRegistry loads.
+	"""
+	_contract_validation_enabled = enabled
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "Contract validation %s" % ("enabled" if enabled else "disabled"))
+
+
+## ============================================================================
+## DIAGNOSTICS & STATISTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func get_subscription_count(event_name: String = "") -> int:
+	"""
+	Get subscriber count for a specific event, or total if event_name is empty.
+	"""
+	
+	if event_name == "":
+		var total = 0
+		for handles in _subscriptions.values():
+			total += handles.size()
+		return total
+	else:
+		return _subscriptions.get(event_name, []).size()
+
+
+func get_registered_events() -> Array[String]:
+	"""
+	Get list of all event names that have at least one subscriber.
+	"""
+	
+	var events: Array[String] = []
+	for event_name in _subscriptions.keys():
+		events.append(event_name)
+	return events
+
+
+func get_event_stats() -> Dictionary:
+	"""
+	Get statistics for all events.
+	"""
+	return _event_stats.duplicate()
+
+
+func get_statistics() -> String:
+	"""
+	Get formatted statistics string for logging.
+	"""
+	
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   EVENTBUS STATISTICS (Phase 6 + Improved)\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Total Events Emitted:     %d\n" % _total_events_emitted
+	stats += "Total Subscriptions:      %d\n" % _total_subscriptions
+	stats += "Total Callback Failures:  %d\n" % _total_callback_failures
+	stats += "Total Rate Limited:       %d\n" % _total_rate_limited
+	stats += "Active Handles:           %d\n" % _active_handles.size()
+	stats += "Registered Event Types:   %d\n" % _subscriptions.size()
+	stats += "Contract Validation:      %s\n" % ("enabled" if _contract_validation_enabled else "disabled")
+	stats += "Rate Limiting:            %s\n" % ("enabled" if _rate_limit_enabled else "disabled")
+	if _rate_limit_enabled:
+		stats += "  Window:                 %dms\n" % _rate_limit_window_ms
+		stats += "  Max per Window:         %d\n" % _rate_limit_max_per_window
+	stats += "═══════════════════════════════════════\n"
+	
+	if not _event_stats.is_empty():
+		stats += "Per-Event Stats:\n"
+		for event_name in _event_stats.keys():
+			var event_stat = _event_stats[event_name]
+			stats += "  %s:\n" % event_name
+			stats += "    Emitted:     %d\n" % event_stat["emitted"]
+			stats += "    Subscribers: %d\n" % event_stat["subscribers"]
+			stats += "    Failures:    %d\n" % event_stat.get("failures", 0)
+	
+	return stats
+
+
+## ============================================================================
+## CLEANUP & SHUTDOWN
+## ============================================================================
+
+func clear_all_subscriptions() -> void:
+	"""
+	Clear all subscriptions. Used during testing or shutdown.
+	WARNING: This invalidates all handles!
+	"""
+	
+	LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Clearing ALL subscriptions (%d handles)" % _active_handles.size())
+	
+	_subscription_lock.lock()
+	
+	for handle in _active_handles.values():
+		handle.invalidate()
+	
+	_subscriptions.clear()
+	_active_handles.clear()
+	_event_stats.clear()
+	
+	_subscription_lock.unlock()
+
+
+func shutdown() -> void:
+	"""
+	Shutdown EventBus and log final statistics.
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "   SHUTTING DOWN (Phase 6 + Improved)")
+	LoggingService.info(LoggingService.Context.CORE, "EventBus", "═══════════════════════════════════════")
+	
+	var stats = get_statistics()
+	for line in stats.split("\n"):
+		if line.strip_edges() != "":
+			LoggingService.info(LoggingService.Context.CORE, "EventBus", line)
+	
+	if _active_handles.size() > 0:
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Shutting down with %d active handles!" % _active_handles.size())
+	
+	if _total_callback_failures > 0:
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Total callback failures during runtime: %d" % _total_callback_failures)
+	
+	if _total_rate_limited > 0:
+		LoggingService.warn(LoggingService.Context.CORE, "EventBus", "Total rate limited events: %d" % _total_rate_limited)
+	
+	clear_all_subscriptions()
+
+
+res://axiom-runtime-/core/services/EventBus.gd.uid
+
+## EventBus.gd.uid
+## Directory: /axiom-runtime-/core/services/EventBus.gd.uid
+##
+
+uid://c0rdqt0qkau0
+
+

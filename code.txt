@@ -1,0 +1,1391 @@
+res://axiom-runtime-/core/Bootstrap.gd
+
+## Bootstrap.gd
+## Directory: /axiom-runtime-/core/Bootstrap.gd
+##
+
+## Bootstrap.gd
+## Phase 6: Enhanced with Contract System Integration
+## Directory: /core/Bootstrap.gd
+##
+## CRITICAL: This is the entry point for the entire runtime
+## Now initializes Phase 6 contract system
+## IMPROVED: Startup timeout enforcement + async bootstrap loading
+
+extends Node
+
+const VERSION = "1.0.1-Phase6-Improved"
+
+var _initialization_complete: bool = false
+var _startup_profile_id: int = -1
+var _startup_config: Node = null
+var _error_recovery: Node = null
+var _initialization_results: Array = []
+
+## IMPROVEMENT: Startup timeout tracking
+var _startup_start_time: int = 0
+var _startup_timeout_ms: int = 10000
+var _startup_timed_out: bool = false
+
+
+## ============================================================================
+## GODOT LIFECYCLE
+## ============================================================================
+
+func _ready() -> void:
+	# IMPROVEMENT: Start timeout tracking
+	_startup_start_time = Time.get_ticks_msec()
+	
+	# Load configuration and error recovery systems first (now async)
+	await _load_bootstrap_systems()
+	
+	# Check timeout after loading bootstrap systems
+	if _check_startup_timeout("Bootstrap Systems Load"):
+		return
+	
+	# Start profiling the entire startup sequence
+	if _startup_config and _startup_config.is_profiling_enabled():
+		_startup_profile_id = LoggingService.start_profile("Runtime Startup")
+	
+	_log_startup_banner()
+	_initialize_runtime()
+	
+	# Phase 6 complete - enter idle state
+	_enter_idle_state()
+
+
+## ============================================================================
+## IMPROVEMENT: STARTUP TIMEOUT ENFORCEMENT
+## ============================================================================
+
+func _check_startup_timeout(step_name: String) -> bool:
+	"""
+	Check if startup has exceeded timeout.
+	Returns true if timed out (should abort).
+	"""
+	var elapsed = Time.get_ticks_msec() - _startup_start_time
+	
+	if elapsed > _startup_timeout_ms:
+		_startup_timed_out = true
+		LoggingService.fatal(LoggingService.Context.CORE, "Bootstrap", "STARTUP TIMEOUT during: %s (elapsed: %dms, limit: %dms)" % [step_name, elapsed, _startup_timeout_ms])
+		_initialization_complete = false
+		return true
+	
+	return false
+
+
+## ============================================================================
+## BOOTSTRAP SYSTEMS (IMPROVED: Async Loading)
+## ============================================================================
+
+func _load_bootstrap_systems() -> void:
+	"""
+	IMPROVED: Async loading of bootstrap systems.
+	Now properly waits for systems to be ready.
+	"""
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Loading bootstrap systems (async)...")
+	
+	# Load StartupConfig
+	var config_script = load("res://core/bootstrap/StartupConfig.gd")
+	if config_script:
+		_startup_config = config_script.new()
+		add_child(_startup_config)
+		await _startup_config.ready  # IMPROVEMENT: Wait for async ready
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ StartupConfig loaded")
+		
+		# Load timeout from config
+		_startup_timeout_ms = _startup_config.get_startup_timeout_ms()
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Startup timeout: %dms" % _startup_timeout_ms)
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "Failed to load StartupConfig")
+	
+	# Load ErrorRecovery
+	var recovery_script = load("res://core/bootstrap/ErrorRecovery.gd")
+	if recovery_script:
+		_error_recovery = recovery_script.new()
+		add_child(_error_recovery)
+		await _error_recovery.ready  # IMPROVEMENT: Wait for async ready
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ ErrorRecovery loaded")
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "Failed to load ErrorRecovery")
+
+
+## ============================================================================
+## STARTUP SEQUENCE
+## ============================================================================
+
+func _log_startup_banner() -> void:
+	print("═══════════════════════════════════════════════════════")
+	print("          AXIOM RUNTIME v%s" % VERSION)
+	print("          Mod-First Game Platform")
+	print("          Phase 6: Contract System Active")
+	print("          Startup Timeout: %dms" % _startup_timeout_ms)
+	print("═══════════════════════════════════════════════════════")
+	print("")
+
+
+func _initialize_runtime() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Starting runtime initialization with error recovery...")
+	
+	# Log configuration
+	if _startup_config:
+		_log_configuration()
+	
+	# Check timeout before starting
+	if _check_startup_timeout("Pre-initialization"):
+		return
+	
+	# Step 1: Initialize LoggingService (already done by autoload)
+	if _check_startup_timeout("LoggingService Check"):
+		return
+	
+	var log_result = _initialize_with_recovery("LoggingService", func():
+		return LoggingService.get_version() != ""
+	)
+	_initialization_results.append(log_result)
+	
+	# Step 2: Initialize PermissionManager
+	if _check_startup_timeout("PermissionManager"):
+		return
+	
+	var perm_result = _initialize_with_recovery("PermissionManager", func():
+		_initialize_permissions()
+		return true
+	)
+	_initialization_results.append(perm_result)
+	
+	# Step 3: Initialize Phase 2 Services
+	if _startup_config and _startup_config.is_service_enabled("eventbus"):
+		if _check_startup_timeout("EventBus"):
+			return
+		
+		var eventbus_result = _initialize_with_recovery("EventBus", func():
+			return EventBus.get_version() != ""
+		)
+		_initialization_results.append(eventbus_result)
+	
+	if _startup_config and _startup_config.is_service_enabled("registry"):
+		if _check_startup_timeout("RegistryManager"):
+			return
+		
+		var registry_result = _initialize_with_recovery("RegistryManager", func():
+			return RegistryManager.get_version() != ""
+		)
+		_initialization_results.append(registry_result)
+	
+	if _startup_config and _startup_config.is_service_enabled("vfs"):
+		if _check_startup_timeout("VirtualFileSystem"):
+			return
+		
+		var vfs_result = _initialize_with_recovery("VirtualFileSystem", func():
+			return VirtualFileSystem.get_version() != ""
+		)
+		_initialization_results.append(vfs_result)
+	
+	# Step 4: Initialize Phase 5 Systems
+	if _check_startup_timeout("MetadataManager"):
+		return
+	
+	var metadata_result = _initialize_with_recovery("MetadataManager", func():
+		return MetadataManager.get_version() != ""
+	)
+	_initialization_results.append(metadata_result)
+	
+	# Step 5: Initialize Phase 6 Contract System
+	if _check_startup_timeout("ContractRegistry"):
+		return
+	
+	var contract_result = _initialize_with_recovery("ContractRegistry", func():
+		return ContractRegistry.get_version() != ""
+	)
+	_initialization_results.append(contract_result)
+	
+	if _check_startup_timeout("CapabilityGrant"):
+		return
+	
+	var capability_result = _initialize_with_recovery("CapabilityGrant", func():
+		return CapabilityGrant.get_version() != ""
+	)
+	_initialization_results.append(capability_result)
+	
+	# Step 6: Godot engine (already initialized)
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ Godot engine initialized")
+	_log_engine_info()
+	
+	# Step 7: Verify all systems
+	if _check_startup_timeout("System Verification"):
+		return
+	
+	_verify_all_systems()
+	
+	# Step 8: Check for any critical failures
+	var has_critical_failure = false
+	for result in _initialization_results:
+		if not result.success and _is_critical_service(result.service_name):
+			has_critical_failure = true
+			break
+	
+	if has_critical_failure or _startup_timed_out:
+		LoggingService.fatal(LoggingService.Context.CORE, "Bootstrap", "Critical service initialization failed or timed out - runtime cannot continue")
+		_initialization_complete = false
+	else:
+		_initialization_complete = true
+		
+		# Log final startup time
+		var total_time = Time.get_ticks_msec() - _startup_start_time
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ Runtime initialization complete in %dms" % total_time)
+
+
+func _initialize_with_recovery(service_name: String, init_func: Callable):
+	if not _error_recovery:
+		LoggingService.warn(LoggingService.Context.CORE, "Bootstrap", "No recovery system - initializing %s directly" % service_name)
+		var success = init_func.call() if init_func.is_valid() else false
+		var result = _error_recovery.InitResult.new(service_name) if _error_recovery else null
+		if result:
+			result.success = success
+		return result
+	
+	return _error_recovery.initialize_service(service_name, init_func)
+
+
+func _is_critical_service(service_name: String) -> bool:
+	return service_name in ["LoggingService", "PermissionManager", "Bootstrap", "ContractRegistry"]
+
+
+func _log_configuration() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "   STARTUP CONFIGURATION")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "═══════════════════════════════════════")
+	
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Profiling:        %s" % str(_startup_config.is_profiling_enabled()))
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Error Recovery:   %s" % str(_startup_config.is_error_recovery_enabled()))
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Startup Timeout:  %dms" % _startup_config.get_startup_timeout_ms())
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Min Log Level:    %d" % _startup_config.get_min_log_level())
+	
+	# Apply log level
+	LoggingService.set_min_log_level(_startup_config.get_min_log_level())
+
+
+func _initialize_permissions() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Initializing permission system...")
+	
+	var has_permission = PermissionManager.check_storage_permission()
+	
+	if has_permission:
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ Storage permission already granted")
+		
+		var saf_path = PermissionManager.get_saf_folder_path()
+		if saf_path != "":
+			LoggingService.switch_to_primary_path(saf_path)
+	else:
+		LoggingService.warn(LoggingService.Context.CORE, "Bootstrap", "Storage permission not granted")
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Using fallback storage path")
+		
+		if PermissionManager.should_show_permission_screen():
+			LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "User should be prompted for SAF access")
+	
+	if _startup_config and _startup_config.is_startup_diagnostics_enabled():
+		var diag = PermissionManager.get_permission_diagnostics()
+		for line in diag.split("\n"):
+			if line.strip_edges() != "":
+				LoggingService.debug(LoggingService.Context.CORE, "PermissionDiag", line)
+
+
+func _log_engine_info() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Engine: Godot %s" % Engine.get_version_info().string)
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Platform: %s" % OS.get_name())
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Processor: %d cores" % OS.get_processor_count())
+	
+	if OS.get_name() == "Android":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Android device detected")
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "User data dir: %s" % OS.get_user_data_dir())
+	
+	if _startup_config and _startup_config.is_memory_diagnostics_enabled():
+		var mem_static = OS.get_static_memory_usage()
+		LoggingService.debug(LoggingService.Context.CORE, "Bootstrap", "Static memory: %.2f MB" % (mem_static / (1024.0 * 1024.0)))
+
+
+func _verify_all_systems() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Verifying all systems...")
+	
+	var all_ok = true
+	
+	# Phase 1 Systems
+	if LoggingService.get_version() != "":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ LoggingService v%s operational" % LoggingService.get_version())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ LoggingService verification failed")
+		all_ok = false
+	
+	var core_log = LoggingService.get_core_log_path()
+	if FileAccess.file_exists(core_log):
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ Core log file accessible: %s" % core_log.get_file())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ Core log file not found: %s" % core_log)
+		all_ok = false
+	
+	var perm_status = PermissionManager.get_permission_status_text()
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ PermissionManager operational")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "  %s" % perm_status)
+	
+	# Phase 2 Systems
+	if EventBus.get_version() != "":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ EventBus v%s operational" % EventBus.get_version())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ EventBus verification failed")
+		all_ok = false
+	
+	if RegistryManager.get_version() != "":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ RegistryManager v%s operational" % RegistryManager.get_version())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ RegistryManager verification failed")
+		all_ok = false
+	
+	if VirtualFileSystem.get_version() != "":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ VirtualFileSystem v%s operational" % VirtualFileSystem.get_version())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ VirtualFileSystem verification failed")
+		all_ok = false
+	
+	# Phase 3 Systems
+	if _startup_config:
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ StartupConfig operational")
+	
+	if _error_recovery:
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ ErrorRecovery operational")
+	
+	# Phase 6 Systems
+	if ContractRegistry.get_version() != "":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ ContractRegistry v%s operational" % ContractRegistry.get_version())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ ContractRegistry verification failed")
+		all_ok = false
+	
+	if CapabilityGrant.get_version() != "":
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ CapabilityGrant v%s operational" % CapabilityGrant.get_version())
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "Bootstrap", "✗ CapabilityGrant verification failed")
+		all_ok = false
+	
+	if all_ok:
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "✓ All systems verified")
+	else:
+		LoggingService.fatal(LoggingService.Context.CORE, "Bootstrap", "✗ System verification FAILED")
+
+
+## ============================================================================
+## IDLE STATE - Phase 6 Completion
+## ============================================================================
+
+func _enter_idle_state() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "   PHASE 6 COMPLETE")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "   Contract System Active")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "═══════════════════════════════════════")
+	
+	if _startup_timed_out:
+		LoggingService.fatal(LoggingService.Context.CORE, "Bootstrap", "⚠ STARTUP TIMED OUT - Runtime in degraded state")
+	
+	if _startup_profile_id >= 0:
+		LoggingService.end_profile(_startup_profile_id)
+	
+	if _error_recovery:
+		var recovery_report = _error_recovery.get_recovery_report()
+		for line in recovery_report.split("\n"):
+			if line.strip_edges() != "":
+				LoggingService.info(LoggingService.Context.CORE, "Bootstrap", line)
+	
+	var stats = LoggingService.get_logging_stats()
+	for line in stats.split("\n"):
+		if line.strip_edges() != "":
+			LoggingService.info(LoggingService.Context.CORE, "Bootstrap", line)
+	
+	if _initialization_complete:
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Runtime initialized and idle")
+		LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "Contract system ready for CoreMod registration")
+	else:
+		LoggingService.fatal(LoggingService.Context.CORE, "Bootstrap", "Runtime initialization INCOMPLETE")
+
+
+## ============================================================================
+## RUNTIME CONTROL
+## ============================================================================
+
+func is_initialized() -> bool:
+	return _initialization_complete
+
+
+func did_startup_timeout() -> bool:
+	"""
+	IMPROVEMENT: Check if startup timed out.
+	"""
+	return _startup_timed_out
+
+
+func get_startup_elapsed_time() -> int:
+	"""
+	IMPROVEMENT: Get time elapsed since startup began.
+	"""
+	return Time.get_ticks_msec() - _startup_start_time
+
+
+func shutdown() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "   SHUTTING DOWN RUNTIME")
+	LoggingService.info(LoggingService.Context.CORE, "Bootstrap", "═══════════════════════════════════════")
+	
+	# Shutdown Phase 6 systems
+	CapabilityGrant.shutdown()
+	ContractRegistry.shutdown()
+	
+	# Shutdown other systems in reverse order
+	VirtualFileSystem.shutdown()
+	RegistryManager.shutdown()
+	EventBus.shutdown()
+	LoggingService.shutdown()
+	
+	_initialization_complete = false
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_runtime_status() -> String:
+	var status = ""
+	status += "═══════════════════════════════════════\n"
+	status += "   AXIOM RUNTIME STATUS (Improved)\n"
+	status += "═══════════════════════════════════════\n"
+	status += "Version:         %s\n" % VERSION
+	status += "Initialized:     %s\n" % str(_initialization_complete)
+	status += "Startup Timeout: %s\n" % str(_startup_timed_out)
+	if _startup_timed_out:
+		status += "  Timeout Limit: %dms\n" % _startup_timeout_ms
+	status += "Startup Time:    %dms\n" % get_startup_elapsed_time()
+	status += "Platform:        %s\n" % OS.get_name()
+	status += "Engine:          Godot %s\n" % Engine.get_version_info().string
+	
+	if _error_recovery:
+		var has_failures = _error_recovery.has_failures()
+		var has_recoveries = _error_recovery.has_recoveries()
+		status += "Has Failures:    %s\n" % str(has_failures)
+		status += "Has Recoveries:  %s\n" % str(has_recoveries)
+	
+	status += "\n"
+	status += "CONTRACT SYSTEM:\n"
+	status += "Contracts:       %d\n" % ContractRegistry.get_all_contracts().size()
+	status += "Capabilities:    active\n"
+	status += "═══════════════════════════════════════\n"
+	
+	return status
+
+
+res://axiom-runtime-/core/Bootstrap.gd.uid
+
+## Bootstrap.gd.uid
+## Directory: /axiom-runtime-/core/Bootstrap.gd.uid
+##
+
+uid://cay3tw0y4amqq
+
+
+res://axiom-runtime-/core/bootstrap /ErrorRecovery.gd
+
+## ErrorRecovery.gd
+## Directory: /axiom-runtime-/core/bootstrap /ErrorRecovery.gd
+##
+
+## ErrorRecovery.gd
+## Phase 3: Enhanced Bootstrapper - Error recovery and fallback system
+## Directory: /core/bootstrap/ErrorRecovery.gd
+##
+## CRITICAL: Handles service initialization failures and recovery
+## Provides graceful degradation and fallback mechanisms
+## IMPROVED: Async-ready for Bootstrap integration
+
+extends Node
+
+const VERSION = "1.0.1-Improved"
+
+## Recovery strategies
+enum Strategy {
+	RETRY,           # Try again with same parameters
+	FALLBACK,        # Use fallback/degraded mode
+	SKIP,            # Skip this service and continue
+	ABORT            # Fatal error - cannot continue
+}
+
+## Service initialization result
+class InitResult:
+	var success: bool
+	var service_name: String
+	var error_message: String
+	var recovery_attempted: bool
+	var recovery_strategy: Strategy
+	
+	func _init(name: String):
+		service_name = name
+		success = false
+		error_message = ""
+		recovery_attempted = false
+		recovery_strategy = Strategy.SKIP
+
+## Internal state
+var _failed_services: Array[String] = []
+var _recovered_services: Array[String] = []
+var _recovery_attempts: Dictionary = {}  # {service_name: attempt_count}
+var _max_retries: int = 3
+
+
+## ============================================================================
+## INITIALIZATION (IMPROVED: Async-ready)
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "Recovery system ready")
+	LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "Bootstrap async loading supported")
+	
+	# Signal ready for async callers
+	await get_tree().process_frame
+
+
+## ============================================================================
+## SERVICE INITIALIZATION WITH RECOVERY
+## ============================================================================
+
+func initialize_service(service_name: String, init_func: Callable) -> InitResult:
+	"""
+	Initialize a service with automatic error recovery.
+	
+	Args:
+		service_name: Name of the service being initialized
+		init_func: Callable that performs initialization (must return bool)
+	
+	Returns:
+		InitResult with success status and recovery info
+	"""
+	
+	var result = InitResult.new(service_name)
+	
+	LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "Initializing service: %s" % service_name)
+	
+	# Attempt initialization
+	var success = _try_initialization(init_func)
+	
+	if success:
+		result.success = true
+		LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "✓ %s initialized successfully" % service_name)
+		return result
+	
+	# Initialization failed - determine recovery strategy
+	result.error_message = "Initialization failed"
+	var strategy = _determine_recovery_strategy(service_name)
+	result.recovery_strategy = strategy
+	
+	LoggingService.error(LoggingService.Context.CORE, "ErrorRecovery", "✗ %s initialization failed" % service_name)
+	
+	# Apply recovery strategy
+	match strategy:
+		Strategy.RETRY:
+			result.success = _handle_retry(service_name, init_func, result)
+		Strategy.FALLBACK:
+			result.success = _handle_fallback(service_name, result)
+		Strategy.SKIP:
+			result.success = _handle_skip(service_name, result)
+		Strategy.ABORT:
+			result.success = _handle_abort(service_name, result)
+	
+	return result
+
+
+func _try_initialization(init_func: Callable) -> bool:
+	"""
+	Safely execute initialization function with error handling.
+	"""
+	
+	if not init_func.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "ErrorRecovery", "Invalid initialization function")
+		return false
+	
+	# Try to call the initialization function
+	var result = init_func.call()
+	
+	# If it returns a bool, use that
+	if typeof(result) == TYPE_BOOL:
+		return result
+	
+	# Otherwise, assume success if no exception
+	return true
+
+
+## ============================================================================
+## RECOVERY STRATEGIES
+## ============================================================================
+
+func _determine_recovery_strategy(service_name: String) -> Strategy:
+	"""
+	Determine the best recovery strategy for a failed service.
+	"""
+	
+	var attempt_count = _recovery_attempts.get(service_name, 0)
+	
+	# Critical services should be retried
+	if _is_critical_service(service_name):
+		if attempt_count < _max_retries:
+			return Strategy.RETRY
+		else:
+			return Strategy.ABORT
+	
+	# Non-critical services can use fallback or skip
+	if _has_fallback(service_name):
+		return Strategy.FALLBACK
+	else:
+		return Strategy.SKIP
+
+
+func _is_critical_service(service_name: String) -> bool:
+	"""
+	Determine if a service is critical for runtime operation.
+	"""
+	
+	var critical_services = [
+		"LoggingService",
+		"PermissionManager",
+		"Bootstrap",
+		"ContractRegistry"
+	]
+	
+	return service_name in critical_services
+
+
+func _has_fallback(service_name: String) -> bool:
+	"""
+	Check if a service has a fallback implementation.
+	"""
+	
+	# Services with known fallbacks
+	var services_with_fallback = [
+		"EventBus",          # Can use signal-based fallback
+		"RegistryManager",   # Can use simple Dictionary fallback
+		"VirtualFileSystem"  # Can use direct file access fallback
+	]
+	
+	return service_name in services_with_fallback
+
+
+## ============================================================================
+## RECOVERY HANDLERS
+## ============================================================================
+
+func _handle_retry(service_name: String, init_func: Callable, result: InitResult) -> bool:
+	"""
+	Retry initialization with exponential backoff.
+	"""
+	
+	var attempt = _recovery_attempts.get(service_name, 0) + 1
+	_recovery_attempts[service_name] = attempt
+	
+	LoggingService.warn(LoggingService.Context.CORE, "ErrorRecovery", "Retrying %s (attempt %d/%d)" % [service_name, attempt, _max_retries])
+	
+	# Exponential backoff: 100ms, 200ms, 400ms, etc.
+	var delay_ms = 100 * pow(2, attempt - 1)
+	OS.delay_msec(int(delay_ms))
+	
+	var success = _try_initialization(init_func)
+	
+	if success:
+		LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "✓ %s recovered after retry" % service_name)
+		_recovered_services.append(service_name)
+		result.recovery_attempted = true
+		return true
+	else:
+		if attempt >= _max_retries:
+			LoggingService.error(LoggingService.Context.CORE, "ErrorRecovery", "✗ %s failed after %d retries" % [service_name, _max_retries])
+			return _handle_fallback(service_name, result) if _has_fallback(service_name) else false
+		else:
+			# Try again
+			return _handle_retry(service_name, init_func, result)
+
+
+func _handle_fallback(service_name: String, result: InitResult) -> bool:
+	"""
+	Use fallback implementation for the service.
+	"""
+	
+	LoggingService.warn(LoggingService.Context.CORE, "ErrorRecovery", "Using fallback mode for: %s" % service_name)
+	
+	result.recovery_attempted = true
+	result.error_message = "Using fallback implementation"
+	
+	# Fallback is considered a success (degraded mode)
+	_recovered_services.append(service_name + " (fallback)")
+	
+	return true
+
+
+func _handle_skip(service_name: String, result: InitResult) -> bool:
+	"""
+	Skip this service and continue with others.
+	"""
+	
+	LoggingService.warn(LoggingService.Context.CORE, "ErrorRecovery", "Skipping non-critical service: %s" % service_name)
+	
+	result.recovery_attempted = false
+	result.error_message = "Service skipped (non-critical)"
+	
+	_failed_services.append(service_name)
+	
+	# Skipping is considered a "success" from recovery perspective
+	return true
+
+
+func _handle_abort(service_name: String, result: InitResult) -> bool:
+	"""
+	Abort startup - critical service failed.
+	"""
+	
+	LoggingService.fatal(LoggingService.Context.CORE, "ErrorRecovery", "FATAL: Critical service failed: %s" % service_name)
+	
+	result.recovery_attempted = false
+	result.error_message = "Critical service failure - cannot continue"
+	
+	_failed_services.append(service_name)
+	
+	return false
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_failed_services() -> Array[String]:
+	return _failed_services.duplicate()
+
+
+func get_recovered_services() -> Array[String]:
+	return _recovered_services.duplicate()
+
+
+func get_recovery_report() -> String:
+	var report = ""
+	report += "═══════════════════════════════════════\n"
+	report += "   ERROR RECOVERY REPORT\n"
+	report += "═══════════════════════════════════════\n"
+	report += "Failed Services:    %d\n" % _failed_services.size()
+	report += "Recovered Services: %d\n" % _recovered_services.size()
+	report += "\n"
+	
+	if not _failed_services.is_empty():
+		report += "Failed:\n"
+		for service in _failed_services:
+			report += "  ✗ %s\n" % service
+		report += "\n"
+	
+	if not _recovered_services.is_empty():
+		report += "Recovered:\n"
+		for service in _recovered_services:
+			report += "  ✓ %s\n" % service
+		report += "\n"
+	
+	if _failed_services.is_empty() and _recovered_services.is_empty():
+		report += "No recovery actions needed - all services initialized successfully\n"
+	
+	return report
+
+
+func has_failures() -> bool:
+	return not _failed_services.is_empty()
+
+
+func has_recoveries() -> bool:
+	return not _recovered_services.is_empty()
+
+
+func get_version() -> String:
+	return VERSION
+
+
+## ============================================================================
+## RESET
+## ============================================================================
+
+func reset() -> void:
+	"""
+	Reset recovery state. Used for testing or restart.
+	"""
+	
+	_failed_services.clear()
+	_recovered_services.clear()
+	_recovery_attempts.clear()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ErrorRecovery", "Recovery state reset")
+
+
+res://axiom-runtime-/core/bootstrap /ErrorRecovery.gd.uid
+
+## ErrorRecovery.gd.uid
+## Directory: /axiom-runtime-/core/bootstrap /ErrorRecovery.gd.uid
+##
+
+uid://twiu12sl5yer
+
+
+res://axiom-runtime-/core/bootstrap /StartupConfig.gd
+
+## StartupConfig.gd
+## Directory: /axiom-runtime-/core/bootstrap /StartupConfig.gd
+##
+
+## StartupConfig.gd
+## Phase 3: Enhanced Bootstrapper - Startup configuration and preferences
+## Directory: /core/bootstrap/StartupConfig.gd
+##
+## CRITICAL: Manages runtime startup configuration and preferences
+## Provides fallback values and validation
+## IMPROVED: Now includes EventBus rate limiting + VFS size limits
+
+extends Node
+
+const VERSION = "1.2.0-Improved"  # Updated for Bootstrap async support
+const CONFIG_FILE = "user://startup_config.cfg"
+
+## Configuration sections
+enum Section {
+	RUNTIME,
+	LOGGING,
+	SERVICES,
+	DIAGNOSTICS,
+	EVENTBUS,  # NEW
+	VFS        # NEW
+}
+
+## Default configuration (EXPANDED)
+const DEFAULTS = {
+	"runtime": {
+		"min_godot_version": "4.0",
+		"enable_profiling": true,
+		"startup_timeout_ms": 10000,
+		"error_recovery_enabled": true
+	},
+	"logging": {
+		"min_log_level": 0,  # VERBOSE
+		"enable_core_log": true,
+		"enable_coremod_logs": true,
+		"log_rotation_enabled": true
+	},
+	"services": {
+		"eventbus_enabled": true,
+		"registry_enabled": true,
+		"vfs_enabled": true,
+		"max_service_init_retries": 3
+	},
+	"diagnostics": {
+		"startup_diagnostics": true,
+		"memory_diagnostics": false,
+		"performance_diagnostics": false
+	},
+	# NEW: EventBus rate limiting configuration
+	"eventbus": {
+		"rate_limiting_enabled": false,  # Disabled by default
+		"rate_limit_window_ms": 1000,    # 1 second window
+		"rate_limit_max_per_window": 1000  # 1000 events per window
+	},
+	# NEW: VFS file size limits
+	"vfs": {
+		"max_file_size_mb": 100,    # 100MB per file
+		"max_mount_size_mb": 1024   # 1GB per mount
+	}
+}
+
+var _config: ConfigFile = ConfigFile.new()
+var _is_loaded: bool = false
+
+
+## ============================================================================
+## INITIALIZATION (IMPROVED: Async-ready)
+## ============================================================================
+
+func _ready() -> void:
+	_load_or_create_config()
+	LoggingService.info(LoggingService.Context.CORE, "StartupConfig", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "StartupConfig", "EventBus & VFS configs available")
+	LoggingService.info(LoggingService.Context.CORE, "StartupConfig", "Bootstrap async loading supported")
+	
+	# Signal ready for async callers
+	await get_tree().process_frame
+
+
+## ============================================================================
+## CONFIGURATION LOADING
+## ============================================================================
+
+func _load_or_create_config() -> void:
+	var err = _config.load(CONFIG_FILE)
+	
+	if err == OK:
+		LoggingService.info(LoggingService.Context.CORE, "StartupConfig", "Loaded configuration from: %s" % CONFIG_FILE)
+		_validate_and_fix_config()
+		_is_loaded = true
+	else:
+		LoggingService.warn(LoggingService.Context.CORE, "StartupConfig", "No config found, creating defaults")
+		_create_default_config()
+		_save_config()
+		_is_loaded = true
+
+
+func _create_default_config() -> void:
+	for section_name in DEFAULTS.keys():
+		for key in DEFAULTS[section_name].keys():
+			_config.set_value(section_name, key, DEFAULTS[section_name][key])
+
+
+func _validate_and_fix_config() -> void:
+	"""
+	Validate existing config and add missing keys with defaults.
+	"""
+	var changed = false
+	
+	for section_name in DEFAULTS.keys():
+		for key in DEFAULTS[section_name].keys():
+			if not _config.has_section_key(section_name, key):
+				LoggingService.warn(LoggingService.Context.CORE, "StartupConfig", "Missing config key: %s/%s, using default" % [section_name, key])
+				_config.set_value(section_name, key, DEFAULTS[section_name][key])
+				changed = true
+	
+	if changed:
+		_save_config()
+
+
+func _save_config() -> void:
+	var err = _config.save(CONFIG_FILE)
+	
+	if err == OK:
+		LoggingService.debug(LoggingService.Context.CORE, "StartupConfig", "Configuration saved")
+	else:
+		LoggingService.error(LoggingService.Context.CORE, "StartupConfig", "Failed to save config: %d" % err)
+
+
+## ============================================================================
+## GETTERS
+## ============================================================================
+
+func get_value(section: String, key: String, default: Variant = null) -> Variant:
+	"""
+	Get configuration value with fallback to default.
+	"""
+	if not _is_loaded:
+		return default if default != null else DEFAULTS.get(section, {}).get(key, null)
+	
+	return _config.get_value(section, key, default if default != null else DEFAULTS.get(section, {}).get(key, null))
+
+
+func set_value(section: String, key: String, value: Variant, save_immediately: bool = true) -> void:
+	"""
+	Set configuration value and optionally save.
+	"""
+	_config.set_value(section, key, value)
+	
+	if save_immediately:
+		_save_config()
+
+
+## ============================================================================
+## RUNTIME SETTINGS
+## ============================================================================
+
+func is_profiling_enabled() -> bool:
+	return get_value("runtime", "enable_profiling", true)
+
+
+func get_startup_timeout_ms() -> int:
+	return get_value("runtime", "startup_timeout_ms", 10000)
+
+
+func is_error_recovery_enabled() -> bool:
+	return get_value("runtime", "error_recovery_enabled", true)
+
+
+func get_min_godot_version() -> String:
+	return get_value("runtime", "min_godot_version", "4.0")
+
+
+## ============================================================================
+## LOGGING SETTINGS
+## ============================================================================
+
+func get_min_log_level() -> int:
+	return get_value("logging", "min_log_level", 0)
+
+
+func is_core_log_enabled() -> bool:
+	return get_value("logging", "enable_core_log", true)
+
+
+func is_coremod_logs_enabled() -> bool:
+	return get_value("logging", "enable_coremod_logs", true)
+
+
+func is_log_rotation_enabled() -> bool:
+	return get_value("logging", "log_rotation_enabled", true)
+
+
+## ============================================================================
+## SERVICE SETTINGS
+## ============================================================================
+
+func is_service_enabled(service_name: String) -> bool:
+	var key = service_name.to_lower() + "_enabled"
+	return get_value("services", key, true)
+
+
+func get_max_service_retries() -> int:
+	return get_value("services", "max_service_init_retries", 3)
+
+
+## ============================================================================
+## DIAGNOSTICS SETTINGS
+## ============================================================================
+
+func is_startup_diagnostics_enabled() -> bool:
+	return get_value("diagnostics", "startup_diagnostics", true)
+
+
+func is_memory_diagnostics_enabled() -> bool:
+	return get_value("diagnostics", "memory_diagnostics", false)
+
+
+func is_performance_diagnostics_enabled() -> bool:
+	return get_value("diagnostics", "performance_diagnostics", false)
+
+
+## ============================================================================
+## NEW: EVENTBUS SETTINGS
+## ============================================================================
+
+func is_rate_limiting_enabled() -> bool:
+	"""
+	Check if EventBus rate limiting is enabled.
+	"""
+	return get_value("eventbus", "rate_limiting_enabled", false)
+
+
+func get_rate_limit_window_ms() -> int:
+	"""
+	Get EventBus rate limit time window in milliseconds.
+	"""
+	return get_value("eventbus", "rate_limit_window_ms", 1000)
+
+
+func get_rate_limit_max_per_window() -> int:
+	"""
+	Get EventBus max events allowed per window.
+	"""
+	return get_value("eventbus", "rate_limit_max_per_window", 1000)
+
+
+func set_rate_limiting(enabled: bool, window_ms: int = 1000, max_per_window: int = 1000) -> void:
+	"""
+	Configure EventBus rate limiting.
+	"""
+	set_value("eventbus", "rate_limiting_enabled", enabled, false)
+	set_value("eventbus", "rate_limit_window_ms", window_ms, false)
+	set_value("eventbus", "rate_limit_max_per_window", max_per_window, true)
+	
+	LoggingService.info(LoggingService.Context.CORE, "StartupConfig", "EventBus rate limiting configured: %s (%d per %dms)" % [str(enabled), max_per_window, window_ms])
+
+
+## ============================================================================
+## NEW: VFS SETTINGS
+## ============================================================================
+
+func get_max_file_size_mb() -> int:
+	"""
+	Get VFS max file size in megabytes.
+	"""
+	return get_value("vfs", "max_file_size_mb", 100)
+
+
+func get_max_file_size_bytes() -> int:
+	"""
+	Get VFS max file size in bytes.
+	"""
+	return get_max_file_size_mb() * 1024 * 1024
+
+
+func get_max_mount_size_mb() -> int:
+	"""
+	Get VFS max mount size in megabytes.
+	"""
+	return get_value("vfs", "max_mount_size_mb", 1024)
+
+
+func get_max_mount_size_bytes() -> int:
+	"""
+	Get VFS max mount size in bytes.
+	"""
+	return get_max_mount_size_mb() * 1024 * 1024
+
+
+func set_vfs_size_limits(max_file_mb: int, max_mount_mb: int) -> void:
+	"""
+	Configure VFS file size limits.
+	"""
+	set_value("vfs", "max_file_size_mb", max_file_mb, false)
+	set_value("vfs", "max_mount_size_mb", max_mount_mb, true)
+	
+	LoggingService.info(LoggingService.Context.CORE, "StartupConfig", "VFS size limits configured: %dMB per file, %dMB per mount" % [max_file_mb, max_mount_mb])
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_config_summary() -> String:
+	var summary = ""
+	summary += "═══════════════════════════════════════\n"
+	summary += "   STARTUP CONFIGURATION (Improved)\n"
+	summary += "═══════════════════════════════════════\n"
+	summary += "Config File:  %s\n" % CONFIG_FILE
+	summary += "Loaded:       %s\n" % str(_is_loaded)
+	summary += "\n"
+	
+	for section_name in DEFAULTS.keys():
+		summary += "[%s]\n" % section_name
+		for key in DEFAULTS[section_name].keys():
+			var value = get_value(section_name, key)
+			summary += "  %s = %s\n" % [key, str(value)]
+		summary += "\n"
+	
+	summary += "═══════════════════════════════════════\n"
+	
+	return summary
+
+
+func reset_to_defaults() -> void:
+	"""
+	Reset all configuration to defaults.
+	"""
+	LoggingService.warn(LoggingService.Context.CORE, "StartupConfig", "Resetting configuration to defaults")
+	
+	_create_default_config()
+	_save_config()
+
+
+res://axiom-runtime-/core/bootstrap /StartupConfig.gd.uid
+
+## StartupConfig.gd.uid
+## Directory: /axiom-runtime-/core/bootstrap /StartupConfig.gd.uid
+##
+
+uid://d0xkpii2h2j7u
+
+
+res://axiom-runtime-/core/contracts/CapabilityGrant.gd
+
+## CapabilityGrant.gd
+## Directory: /axiom-runtime-/core/contracts/CapabilityGrant.gd
+##
+
+## CapabilityGrant.gd
+## Phase 6: Game Interfaces - Capability grant tracking
+## Directory: /core/contracts/CapabilityGrant.gd
+##
+## CRITICAL: Tracks what capabilities each mod has
+## All grants are auditable and revocable
+## Core never interprets capability semantics
+
+extends Node
+
+const VERSION = "1.0.0"
+
+## Capability types
+enum CapabilityType {
+	EVENT_SUBSCRIBE,    # Can subscribe to an event
+	REGISTRY_EXTEND,    # Can add entries to a registry
+	SYSTEM_OVERRIDE,    # Can override a system
+	CUSTOM              # CoreMod-defined capability
+}
+
+## Capability grant record
+class GrantRecord:
+	var capability_id: String
+	var capability_type: CapabilityType
+	var mod_id: String
+	var contract_id: String  # The contract this capability applies to
+	var granted_at: int
+	var metadata: Dictionary  # Opaque to Core
+	
+	func _init(cap_id: String, cap_type: CapabilityType, mod: String, contract: String, meta: Dictionary = {}):
+		capability_id = cap_id
+		capability_type = cap_type
+		mod_id = mod
+		contract_id = contract
+		granted_at = Time.get_ticks_msec()
+		metadata = meta.duplicate()
+
+## Internal state
+var _grants: Dictionary = {}  # {capability_id: GrantRecord}
+var _grants_by_mod: Dictionary = {}  # {mod_id: [capability_ids]}
+var _grants_by_contract: Dictionary = {}  # {contract_id: [capability_ids]}
+
+## Statistics
+var _total_grants: int = 0
+var _total_revocations: int = 0
+
+## Thread safety
+var _grant_lock: Mutex = Mutex.new()
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "CapabilityGrant", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "CapabilityGrant", "Capability tracking ready - auditable")
+
+## ============================================================================
+## GRANT MANAGEMENT
+## ============================================================================
+
+func grant_capability(capability_id: String, capability_type: CapabilityType, mod_id: String, contract_id: String, metadata: Dictionary = {}) -> bool:
+	if capability_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "CapabilityGrant", "Capability ID cannot be empty")
+		return false
+	
+	_grant_lock.lock()
+	
+	if _grants.has(capability_id):
+		_grant_lock.unlock()
+		LoggingService.warn(LoggingService.Context.CORE, "CapabilityGrant", "Capability '%s' already granted" % capability_id)
+		return false
+	
+	var record = GrantRecord.new(capability_id, capability_type, mod_id, contract_id, metadata)
+	_grants[capability_id] = record
+	
+	if not _grants_by_mod.has(mod_id):
+		_grants_by_mod[mod_id] = []
+	_grants_by_mod[mod_id].append(capability_id)
+	
+	if not _grants_by_contract.has(contract_id):
+		_grants_by_contract[contract_id] = []
+	_grants_by_contract[contract_id].append(capability_id)
+	
+	_total_grants += 1
+	
+	_grant_lock.unlock()
+	
+	var type_name = CapabilityType.keys()[capability_type]
+	LoggingService.info(LoggingService.Context.CORE, "CapabilityGrant", "Granted capability: %s [type=%s, mod=%s, contract=%s]" % [capability_id, type_name, mod_id, contract_id])
+	
+	return true
+
+func revoke_capability(capability_id: String) -> bool:
+	_grant_lock.lock()
+	
+	if not _grants.has(capability_id):
+		_grant_lock.unlock()
+		return false
+	
+	var record: GrantRecord = _grants[capability_id]
+	var mod_id = record.mod_id
+	var contract_id = record.contract_id
+	
+	_grants.erase(capability_id)
+	
+	if _grants_by_mod.has(mod_id):
+		_grants_by_mod[mod_id].erase(capability_id)
+	
+	if _grants_by_contract.has(contract_id):
+		_grants_by_contract[contract_id].erase(capability_id)
+	
+	_total_revocations += 1
+	
+	_grant_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "CapabilityGrant", "Revoked capability: %s" % capability_id)
+	
+	return true
+
+func revoke_all_for_mod(mod_id: String) -> int:
+	_grant_lock.lock()
+	
+	if not _grants_by_mod.has(mod_id):
+		_grant_lock.unlock()
+		return 0
+	
+	var capability_ids = _grants_by_mod[mod_id].duplicate()
+	
+	_grant_lock.unlock()
+	
+	var count = 0
+	for capability_id in capability_ids:
+		if revoke_capability(capability_id):
+			count += 1
+	
+	LoggingService.info(LoggingService.Context.CORE, "CapabilityGrant", "Revoked %d capabilities for mod: %s" % [count, mod_id])
+	
+	return count
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+func has_capability(capability_id: String) -> bool:
+	_grant_lock.lock()
+	var has = _grants.has(capability_id)
+	_grant_lock.unlock()
+	return has
+
+func mod_has_capability(mod_id: String, contract_id: String, capability_type: CapabilityType) -> bool:
+	_grant_lock.lock()
+	
+	if not _grants_by_mod.has(mod_id):
+		_grant_lock.unlock()
+		return false
+	
+	for capability_id in _grants_by_mod[mod_id]:
+		var record: GrantRecord = _grants[capability_id]
+		if record.contract_id == contract_id and record.capability_type == capability_type:
+			_grant_lock.unlock()
+			return true
+	
+	_grant_lock.unlock()
+	return false
+
+func get_capabilities_for_mod(mod_id: String) -> Array[String]:
+	_grant_lock.lock()
+	var caps: Array[String] = []
+	if _grants_by_mod.has(mod_id):
+		caps = _grants_by_mod[mod_id].duplicate()
+	_grant_lock.unlock()
+	return caps
+
+func get_version() -> String:
+	return VERSION
+
+func get_statistics() -> String:
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   CAPABILITY GRANT STATISTICS\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Total Grants:         %d\n" % _total_grants
+	stats += "Total Revocations:    %d\n" % _total_revocations
+	stats += "Active Grants:        %d\n" % _grants.size()
+	stats += "═══════════════════════════════════════\n"
+	return stats
+
+func shutdown() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "CapabilityGrant", "Shutting down - %d active grants" % _grants.size())
+	_grant_lock.lock()
+	_grants.clear()
+	_grants_by_mod.clear()
+	_grants_by_contract.clear()
+	_grant_lock.unlock()
+
+
+res://axiom-runtime-/core/contracts/CapabilityGrant.gd.uid
+
+## CapabilityGrant.gd.uid
+## Directory: /axiom-runtime-/core/contracts/CapabilityGrant.gd.uid
+##
+
+uid://ckdjkgchoq1oj
+
+

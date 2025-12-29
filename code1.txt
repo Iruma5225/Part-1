@@ -1,0 +1,1583 @@
+res://axiom-runtime-/core/contracts/ContractRegistry.gd
+
+## ContractRegistry.gd
+## Directory: /axiom-runtime-/core/contracts/ContractRegistry.gd
+##
+
+## ContractRegistry.gd
+## Phase 6: Game Interfaces - Central contract registry
+## Directory: /core/contracts/ContractRegistry.gd
+##
+## CRITICAL: Core manages contract lifecycle, but never interprets semantics
+## All contracts are opaque IDs with metadata only
+## CoreMods register contracts, mods query and bind to them
+
+extends Node
+
+const VERSION = "1.0.0"
+
+## Contract type enumeration
+enum ContractType {
+	EVENT,
+	SYSTEM,
+	REGISTRY,
+	UI,
+	SAVE_HOOK,
+	CUSTOM  # For CoreMod-defined types
+}
+
+## Contract record - metadata only
+class ContractRecord:
+	var contract_id: String
+	var contract_type: ContractType
+	var coremod_id: String
+	var metadata: Dictionary  # Opaque to Core
+	var registered_at: int
+	
+	func _init(id: String, type: ContractType, coremod: String, meta: Dictionary):
+		contract_id = id
+		contract_type = type
+		coremod_id = coremod
+		metadata = meta.duplicate()
+		registered_at = Time.get_ticks_msec()
+
+## Internal state
+var _contracts: Dictionary = {}  # {contract_id: ContractRecord}
+var _contracts_by_coremod: Dictionary = {}  # {coremod_id: [contract_ids]}
+var _contracts_by_type: Dictionary = {}  # {ContractType: [contract_ids]}
+
+## Statistics
+var _total_contracts_registered: int = 0
+var _total_contracts_unregistered: int = 0
+
+## Thread safety
+var _registry_lock: Mutex = Mutex.new()
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	_initialize_type_indices()
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "Contract system ready - semantic-free")
+
+
+func _initialize_type_indices() -> void:
+	"""
+	Pre-initialize indices for all contract types.
+	"""
+	for contract_type in ContractType.values():
+		_contracts_by_type[contract_type] = []
+
+
+## ============================================================================
+## CONTRACT REGISTRATION (CoreMod-facing)
+## ============================================================================
+
+func register_contract(contract_id: String, contract_type: ContractType, coremod_id: String, metadata: Dictionary) -> bool:
+	"""
+	Register a contract. Only CoreMods should call this.
+	
+	Args:
+		contract_id: Unique identifier (must be globally unique)
+		contract_type: Type of contract
+		coremod_id: ID of the CoreMod registering this
+		metadata: Opaque metadata (Core never interprets this)
+	
+	Returns:
+		true if registered successfully
+	"""
+	
+	if contract_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "ContractRegistry", "Cannot register contract with empty ID")
+		return false
+	
+	if coremod_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "ContractRegistry", "Cannot register contract without CoreMod ID")
+		return false
+	
+	_registry_lock.lock()
+	
+	# Check for duplicates
+	if _contracts.has(contract_id):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "ContractRegistry", "Contract '%s' already registered" % contract_id)
+		return false
+	
+	# Create record
+	var record = ContractRecord.new(contract_id, contract_type, coremod_id, metadata)
+	_contracts[contract_id] = record
+	
+	# Index by CoreMod
+	if not _contracts_by_coremod.has(coremod_id):
+		_contracts_by_coremod[coremod_id] = []
+	_contracts_by_coremod[coremod_id].append(contract_id)
+	
+	# Index by type
+	_contracts_by_type[contract_type].append(contract_id)
+	
+	_total_contracts_registered += 1
+	
+	_registry_lock.unlock()
+	
+	var type_name = ContractType.keys()[contract_type]
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "Registered contract: %s [type=%s, coremod=%s]" % [contract_id, type_name, coremod_id])
+	
+	return true
+
+
+func unregister_contract(contract_id: String) -> bool:
+	"""
+	Unregister a contract.
+	"""
+	
+	_registry_lock.lock()
+	
+	if not _contracts.has(contract_id):
+		_registry_lock.unlock()
+		LoggingService.warn(LoggingService.Context.CORE, "ContractRegistry", "Contract '%s' not found for unregistration" % contract_id)
+		return false
+	
+	var record: ContractRecord = _contracts[contract_id]
+	var coremod_id = record.coremod_id
+	var contract_type = record.contract_type
+	
+	# Remove from main registry
+	_contracts.erase(contract_id)
+	
+	# Remove from CoreMod index
+	if _contracts_by_coremod.has(coremod_id):
+		_contracts_by_coremod[coremod_id].erase(contract_id)
+		if _contracts_by_coremod[coremod_id].is_empty():
+			_contracts_by_coremod.erase(coremod_id)
+	
+	# Remove from type index
+	_contracts_by_type[contract_type].erase(contract_id)
+	
+	_total_contracts_unregistered += 1
+	
+	_registry_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "Unregistered contract: %s" % contract_id)
+	
+	return true
+
+
+func unregister_all_for_coremod(coremod_id: String) -> int:
+	"""
+	Unregister all contracts for a CoreMod.
+	Called when CoreMod unloads.
+	
+	Returns:
+		Number of contracts unregistered
+	"""
+	
+	_registry_lock.lock()
+	
+	if not _contracts_by_coremod.has(coremod_id):
+		_registry_lock.unlock()
+		return 0
+	
+	var contract_ids = _contracts_by_coremod[coremod_id].duplicate()
+	
+	_registry_lock.unlock()
+	
+	var count = 0
+	for contract_id in contract_ids:
+		if unregister_contract(contract_id):
+			count += 1
+	
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "Unregistered %d contracts for CoreMod: %s" % [count, coremod_id])
+	
+	return count
+
+
+## ============================================================================
+## CONTRACT QUERY (Mod-facing)
+## ============================================================================
+
+func has_contract(contract_id: String) -> bool:
+	"""
+	Check if a contract exists.
+	"""
+	_registry_lock.lock()
+	var exists = _contracts.has(contract_id)
+	_registry_lock.unlock()
+	return exists
+
+
+func get_contract_metadata(contract_id: String) -> Dictionary:
+	"""
+	Get contract metadata (opaque to Core).
+	Returns empty dict if not found.
+	"""
+	_registry_lock.lock()
+	
+	if not _contracts.has(contract_id):
+		_registry_lock.unlock()
+		return {}
+	
+	var record: ContractRecord = _contracts[contract_id]
+	var metadata = record.metadata.duplicate()
+	
+	_registry_lock.unlock()
+	
+	return metadata
+
+
+func get_contract_type(contract_id: String) -> ContractType:
+	"""
+	Get contract type.
+	Returns -1 if not found.
+	"""
+	_registry_lock.lock()
+	
+	if not _contracts.has(contract_id):
+		_registry_lock.unlock()
+		return -1
+	
+	var record: ContractRecord = _contracts[contract_id]
+	var type = record.contract_type
+	
+	_registry_lock.unlock()
+	
+	return type
+
+
+func get_contract_coremod(contract_id: String) -> String:
+	"""
+	Get CoreMod ID that registered this contract.
+	"""
+	_registry_lock.lock()
+	
+	if not _contracts.has(contract_id):
+		_registry_lock.unlock()
+		return ""
+	
+	var record: ContractRecord = _contracts[contract_id]
+	var coremod = record.coremod_id
+	
+	_registry_lock.unlock()
+	
+	return coremod
+
+
+func get_all_contracts() -> Array[String]:
+	"""
+	Get all registered contract IDs.
+	"""
+	_registry_lock.lock()
+	var ids: Array[String] = []
+	for contract_id in _contracts.keys():
+		ids.append(contract_id)
+	_registry_lock.unlock()
+	return ids
+
+
+func get_contracts_by_coremod(coremod_id: String) -> Array[String]:
+	"""
+	Get all contract IDs registered by a CoreMod.
+	"""
+	_registry_lock.lock()
+	var ids: Array[String] = []
+	if _contracts_by_coremod.has(coremod_id):
+		ids = _contracts_by_coremod[coremod_id].duplicate()
+	_registry_lock.unlock()
+	return ids
+
+
+func get_contracts_by_type(contract_type: ContractType) -> Array[String]:
+	"""
+	Get all contract IDs of a specific type.
+	"""
+	_registry_lock.lock()
+	var ids: Array[String] = []
+	if _contracts_by_type.has(contract_type):
+		ids = _contracts_by_type[contract_type].duplicate()
+	_registry_lock.unlock()
+	return ids
+
+
+func get_contracts_by_type_for_coremod(contract_type: ContractType, coremod_id: String) -> Array[String]:
+	"""
+	Get all contract IDs of a specific type for a specific CoreMod.
+	"""
+	_registry_lock.lock()
+	
+	var ids: Array[String] = []
+	
+	if not _contracts_by_coremod.has(coremod_id):
+		_registry_lock.unlock()
+		return ids
+	
+	for contract_id in _contracts_by_coremod[coremod_id]:
+		var record: ContractRecord = _contracts[contract_id]
+		if record.contract_type == contract_type:
+			ids.append(contract_id)
+	
+	_registry_lock.unlock()
+	
+	return ids
+
+
+## ============================================================================
+## VALIDATION
+## ============================================================================
+
+func validate_contract_reference(contract_id: String, expected_type: ContractType = -1) -> bool:
+	"""
+	Validate that a contract reference is valid.
+	Optionally check type.
+	"""
+	_registry_lock.lock()
+	
+	if not _contracts.has(contract_id):
+		_registry_lock.unlock()
+		return false
+	
+	if expected_type != -1:
+		var record: ContractRecord = _contracts[contract_id]
+		if record.contract_type != expected_type:
+			_registry_lock.unlock()
+			return false
+	
+	_registry_lock.unlock()
+	
+	return true
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func get_statistics() -> String:
+	"""
+	Get formatted statistics.
+	"""
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   CONTRACT REGISTRY STATISTICS\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Total Contracts:      %d\n" % _contracts.size()
+	stats += "Registered:           %d\n" % _total_contracts_registered
+	stats += "Unregistered:         %d\n" % _total_contracts_unregistered
+	stats += "Active CoreMods:      %d\n" % _contracts_by_coremod.size()
+	stats += "═══════════════════════════════════════\n"
+	
+	# Per-type breakdown
+	stats += "Contracts by Type:\n"
+	for contract_type in ContractType.values():
+		if contract_type == ContractType.CUSTOM:
+			continue
+		var type_name = ContractType.keys()[contract_type]
+		var count = _contracts_by_type[contract_type].size()
+		stats += "  %s: %d\n" % [type_name, count]
+	
+	stats += "\n"
+	
+	# Per-CoreMod breakdown
+	if not _contracts_by_coremod.is_empty():
+		stats += "Contracts by CoreMod:\n"
+		for coremod_id in _contracts_by_coremod.keys():
+			var count = _contracts_by_coremod[coremod_id].size()
+			stats += "  %s: %d\n" % [coremod_id, count]
+	
+	stats += "═══════════════════════════════════════\n"
+	
+	return stats
+
+
+## ============================================================================
+## SHUTDOWN
+## ============================================================================
+
+func shutdown() -> void:
+	"""
+	Shutdown contract registry.
+	"""
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "   SHUTTING DOWN")
+	LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", "═══════════════════════════════════════")
+	
+	var stats = get_statistics()
+	for line in stats.split("\n"):
+		if line.strip_edges() != "":
+			LoggingService.info(LoggingService.Context.CORE, "ContractRegistry", line)
+	
+	_registry_lock.lock()
+	
+	_contracts.clear()
+	_contracts_by_coremod.clear()
+	for contract_type in ContractType.values():
+		_contracts_by_type[contract_type].clear()
+	
+	_registry_lock.unlock()
+
+
+res://axiom-runtime-/core/contracts/ContractRegistry.gd.uid
+
+## ContractRegistry.gd.uid
+## Directory: /axiom-runtime-/core/contracts/ContractRegistry.gd.uid
+##
+
+uid://ba6tx1yv7wwq
+
+
+res://axiom-runtime-/core/contracts/EventContract.gd
+
+## EventContract.gd
+## Directory: /axiom-runtime-/core/contracts/EventContract.gd
+##
+
+## EventContract.gd
+## Phase 6: Game Interfaces - Event contract definitions
+## Directory: /core/contracts/EventContract.gd
+##
+## CRITICAL: Defines event contract structure
+## Core never interprets event payloads or semantics
+## Events are opaque routing with cancellation support
+
+extends RefCounted
+
+const VERSION = "1.0.0"
+
+## Event contract metadata structure
+class EventMetadata:
+	var event_id: String
+	var cancellable: bool
+	var description: String
+	var payload_schema: Dictionary  # Optional, for documentation
+	var priority: int  # For event ordering (optional)
+	
+	func _init():
+		event_id = ""
+		cancellable = false
+		description = ""
+		payload_schema = {}
+		priority = 0
+	
+	func to_dict() -> Dictionary:
+		return {
+			"event_id": event_id,
+			"cancellable": cancellable,
+			"description": description,
+			"payload_schema": payload_schema,
+			"priority": priority
+		}
+	
+	static func from_dict(data: Dictionary) -> EventMetadata:
+		var meta = EventMetadata.new()
+		meta.event_id = data.get("event_id", "")
+		meta.cancellable = data.get("cancellable", false)
+		meta.description = data.get("description", "")
+		meta.payload_schema = data.get("payload_schema", {})
+		meta.priority = data.get("priority", 0)
+		return meta
+
+
+## Event payload wrapper (for cancellable events)
+class EventPayload:
+	var data: Variant  # Opaque to Core
+	var cancelled: bool = false
+	var cancellation_reason: String = ""
+	
+	func _init(payload_data: Variant = null):
+		data = payload_data
+	
+	func cancel(reason: String = "") -> void:
+		cancelled = true
+		cancellation_reason = reason
+	
+	func is_cancelled() -> bool:
+		return cancelled
+
+
+## ============================================================================
+## CONTRACT REGISTRATION HELPERS
+## ============================================================================
+
+static func register_event(coremod_id: String, metadata: EventMetadata) -> bool:
+	"""
+	Register an event contract with the ContractRegistry.
+	
+	Args:
+		coremod_id: ID of the CoreMod registering this event
+		metadata: Event metadata
+	
+	Returns:
+		true if registered successfully
+	"""
+	
+	if metadata.event_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "EventContract", "Event ID cannot be empty")
+		return false
+	
+	return ContractRegistry.register_contract(
+		metadata.event_id,
+		ContractRegistry.ContractType.EVENT,
+		coremod_id,
+		metadata.to_dict()
+	)
+
+
+static func unregister_event(event_id: String) -> bool:
+	"""
+	Unregister an event contract.
+	"""
+	return ContractRegistry.unregister_contract(event_id)
+
+
+## ============================================================================
+## EVENT EMISSION (CoreMod-facing)
+## ============================================================================
+
+static func emit_event(event_id: String, payload: Variant = null) -> EventPayload:
+	"""
+	Emit an event through the EventBus.
+	Returns EventPayload for cancellable events, null otherwise.
+	
+	Args:
+		event_id: Contract ID of the event
+		payload: Opaque payload (Core never interprets this)
+	
+	Returns:
+		EventPayload if cancellable, null otherwise
+	"""
+	
+	# Validate contract exists
+	if not ContractRegistry.has_contract(event_id):
+		LoggingService.error(LoggingService.Context.CORE, "EventContract", "Event contract not found: %s" % event_id)
+		return null
+	
+	# Get metadata
+	var meta_dict = ContractRegistry.get_contract_metadata(event_id)
+	var metadata = EventMetadata.from_dict(meta_dict)
+	
+	# Handle cancellable vs non-cancellable
+	if metadata.cancellable:
+		var event_payload = EventPayload.new(payload)
+		EventBus.emit_event(event_id, event_payload)
+		return event_payload
+	else:
+		EventBus.emit_event(event_id, payload)
+		return null
+
+
+## ============================================================================
+## EVENT SUBSCRIPTION (Mod-facing)
+## ============================================================================
+
+static func subscribe_to_event(event_id: String, callback: Callable, subscriber_id: String) -> Variant:
+	"""
+	Subscribe to an event.
+	
+	Args:
+		event_id: Contract ID of the event
+		callback: Function to call when event fires
+		subscriber_id: ID of the subscriber (for cleanup)
+	
+	Returns:
+		EventBus handle for unsubscription
+	"""
+	
+	# Validate contract exists
+	if not ContractRegistry.has_contract(event_id):
+		LoggingService.error(LoggingService.Context.CORE, "EventContract", "Event contract not found: %s" % event_id)
+		return null
+	
+	# Subscribe through EventBus
+	return EventBus.subscribe(event_id, callback, subscriber_id)
+
+
+static func unsubscribe_from_event(handle: Variant) -> void:
+	"""
+	Unsubscribe from an event using handle.
+	"""
+	EventBus.unsubscribe(handle)
+
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+static func is_event_cancellable(event_id: String) -> bool:
+	"""
+	Check if an event is cancellable.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(event_id)
+	if meta_dict.is_empty():
+		return false
+	
+	return meta_dict.get("cancellable", false)
+
+
+static func get_event_description(event_id: String) -> String:
+	"""
+	Get event description.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(event_id)
+	if meta_dict.is_empty():
+		return ""
+	
+	return meta_dict.get("description", "")
+
+
+static func get_event_schema(event_id: String) -> Dictionary:
+	"""
+	Get event payload schema (for documentation).
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(event_id)
+	if meta_dict.is_empty():
+		return {}
+	
+	return meta_dict.get("payload_schema", {})
+
+
+## ============================================================================
+## VALIDATION
+## ============================================================================
+
+static func validate_event_contract(event_id: String) -> bool:
+	"""
+	Validate that an event contract is properly registered.
+	"""
+	return ContractRegistry.validate_contract_reference(event_id, ContractRegistry.ContractType.EVENT)
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+static func get_version() -> String:
+	return VERSION
+
+
+static func get_all_events() -> Array[String]:
+	"""
+	Get all registered event contracts.
+	"""
+	return ContractRegistry.get_contracts_by_type(ContractRegistry.ContractType.EVENT)
+
+
+static func get_events_for_coremod(coremod_id: String) -> Array[String]:
+	"""
+	Get all event contracts for a specific CoreMod.
+	"""
+	return ContractRegistry.get_contracts_by_type_for_coremod(ContractRegistry.ContractType.EVENT, coremod_id)
+
+
+res://axiom-runtime-/core/contracts/EventContract.gd.uid
+
+## EventContract.gd.uid
+## Directory: /axiom-runtime-/core/contracts/EventContract.gd.uid
+##
+
+uid://c1hajewy43gns
+
+
+res://axiom-runtime-/core/contracts/RegistryContract.gd
+
+## RegistryContract.gd
+## Directory: /axiom-runtime-/core/contracts/RegistryContract.gd
+##
+
+## RegistryContract.gd
+## Phase 6: Game Interfaces - Registry contract definitions
+## Directory: /core/contracts/RegistryContract.gd
+##
+## CRITICAL: Defines registry contract structure
+## Registries can be extended by mods if explicitly allowed
+## Core never interprets registry data
+
+extends RefCounted
+
+const VERSION = "1.0.0"
+
+class RegistryMetadata:
+	var registry_id: String
+	var extensible: bool  # Can mods add entries?
+	var description: String
+	var schema: Dictionary  # Optional, for documentation
+	
+	func _init():
+		registry_id = ""
+		extensible = false
+		description = ""
+		schema = {}
+	
+	func to_dict() -> Dictionary:
+		return {
+			"registry_id": registry_id,
+			"extensible": extensible,
+			"description": description,
+			"schema": schema
+		}
+	
+	static func from_dict(data: Dictionary) -> RegistryMetadata:
+		var meta = RegistryMetadata.new()
+		meta.registry_id = data.get("registry_id", "")
+		meta.extensible = data.get("extensible", false)
+		meta.description = data.get("description", "")
+		meta.schema = data.get("schema", {})
+		return meta
+
+static func register_registry(coremod_id: String, metadata: RegistryMetadata) -> bool:
+	if metadata.registry_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "RegistryContract", "Registry ID cannot be empty")
+		return false
+	
+	if metadata.extensible:
+		LoggingService.info(LoggingService.Context.CORE, "RegistryContract", "Registry '%s' is EXTENSIBLE" % metadata.registry_id)
+	else:
+		LoggingService.info(LoggingService.Context.CORE, "RegistryContract", "Registry '%s' is SEALED" % metadata.registry_id)
+	
+	return ContractRegistry.register_contract(
+		metadata.registry_id,
+		ContractRegistry.ContractType.REGISTRY,
+		coremod_id,
+		metadata.to_dict()
+	)
+
+static func unregister_registry(registry_id: String) -> bool:
+	return ContractRegistry.unregister_contract(registry_id)
+
+static func is_registry_extensible(registry_id: String) -> bool:
+	var meta_dict = ContractRegistry.get_contract_metadata(registry_id)
+	if meta_dict.is_empty():
+		return false
+	return meta_dict.get("extensible", false)
+
+static func get_registry_schema(registry_id: String) -> Dictionary:
+	var meta_dict = ContractRegistry.get_contract_metadata(registry_id)
+	if meta_dict.is_empty():
+		return {}
+	return meta_dict.get("schema", {})
+
+static func get_all_registries() -> Array[String]:
+	return ContractRegistry.get_contracts_by_type(ContractRegistry.ContractType.REGISTRY)
+
+static func get_version() -> String:
+	return VERSION
+
+
+res://axiom-runtime-/core/contracts/RegistryContract.gd.uid
+
+## RegistryContract.gd.uid
+## Directory: /axiom-runtime-/core/contracts/RegistryContract.gd.uid
+##
+
+uid://ddf2msllj60ia
+
+
+res://axiom-runtime-/core/contracts/SaveHookContract.gd
+
+## SaveHookContract.gd
+## Directory: /axiom-runtime-/core/contracts/SaveHookContract.gd
+##
+
+## SaveHookContract.gd
+## Phase 6: Game Interfaces - Save hook contract definitions
+## Directory: /core/contracts/SaveHookContract.gd
+##
+## CRITICAL: Defines save/load hook contracts
+## Allows mods to participate in save/load lifecycle
+## Core never interprets save data semantics
+
+extends RefCounted
+
+const VERSION = "1.0.0"
+
+## Save hook types
+enum HookType {
+	PRE_SAVE,    # Called before save begins
+	POST_SAVE,   # Called after save completes
+	PRE_LOAD,    # Called before load begins
+	POST_LOAD    # Called after load completes
+}
+
+## Save hook metadata structure
+class SaveHookMetadata:
+	var hook_id: String
+	var hook_type: HookType
+	var description: String
+	var priority: int  # Lower numbers execute first
+	
+	func _init():
+		hook_id = ""
+		hook_type = HookType.PRE_SAVE
+		description = ""
+		priority = 100
+	
+	func to_dict() -> Dictionary:
+		return {
+			"hook_id": hook_id,
+			"hook_type": HookType.keys()[hook_type],
+			"description": description,
+			"priority": priority
+		}
+	
+	static func from_dict(data: Dictionary) -> SaveHookMetadata:
+		var meta = SaveHookMetadata.new()
+		meta.hook_id = data.get("hook_id", "")
+		
+		var hook_type_str = data.get("hook_type", "PRE_SAVE")
+		meta.hook_type = HookType.get(hook_type_str) if HookType.has(hook_type_str) else HookType.PRE_SAVE
+		
+		meta.description = data.get("description", "")
+		meta.priority = data.get("priority", 100)
+		return meta
+
+
+## Hook registration tracking
+class HookRegistration:
+	var hook_id: String
+	var hook_type: HookType
+	var mod_id: String
+	var callback: Callable
+	var priority: int
+	var timestamp: int
+	
+	func _init(id: String, type: HookType, mod: String, func_callback: Callable, prio: int):
+		hook_id = id
+		hook_type = type
+		mod_id = mod
+		callback = func_callback
+		priority = prio
+		timestamp = Time.get_ticks_msec()
+
+
+## Internal state
+static var _registered_hooks: Dictionary = {}  # {hook_id: HookRegistration}
+static var _hooks_by_type: Dictionary = {}     # {HookType: [hook_ids]} (sorted by priority)
+static var _hooks_by_mod: Dictionary = {}      # {mod_id: [hook_ids]}
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+static func _static_init() -> void:
+	# Initialize hook type indices
+	for hook_type in HookType.values():
+		_hooks_by_type[hook_type] = []
+
+
+## ============================================================================
+## CONTRACT REGISTRATION HELPERS
+## ============================================================================
+
+static func register_save_hook(coremod_id: String, metadata: SaveHookMetadata) -> bool:
+	"""
+	Register a save hook contract with the ContractRegistry.
+	
+	Args:
+		coremod_id: ID of the CoreMod registering this hook
+		metadata: Hook metadata
+	
+	Returns:
+		true if registered successfully
+	"""
+	
+	if metadata.hook_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "SaveHookContract", "Hook ID cannot be empty")
+		return false
+	
+	var hook_type_name = HookType.keys()[metadata.hook_type]
+	LoggingService.info(LoggingService.Context.CORE, "SaveHookContract", "Hook '%s' [type=%s, priority=%d]" % [metadata.hook_id, hook_type_name, metadata.priority])
+	
+	return ContractRegistry.register_contract(
+		metadata.hook_id,
+		ContractRegistry.ContractType.SAVE_HOOK,
+		coremod_id,
+		metadata.to_dict()
+	)
+
+
+static func unregister_save_hook(hook_id: String) -> bool:
+	"""
+	Unregister a save hook contract.
+	"""
+	# Clear any active registrations
+	if _registered_hooks.has(hook_id):
+		var registration: HookRegistration = _registered_hooks[hook_id]
+		_unregister_hook_internal(registration)
+	
+	return ContractRegistry.unregister_contract(hook_id)
+
+
+## ============================================================================
+## HOOK REGISTRATION (Mod-facing)
+## ============================================================================
+
+static func register_hook_callback(hook_id: String, mod_id: String, callback: Callable) -> bool:
+	"""
+	Register a callback for a save hook.
+	
+	Args:
+		hook_id: Contract ID of the hook
+		mod_id: ID of the mod registering
+		callback: Function to call when hook fires
+	
+	Returns:
+		true if registration successful
+	"""
+	
+	# Validate contract exists
+	if not ContractRegistry.has_contract(hook_id):
+		LoggingService.error(LoggingService.Context.CORE, "SaveHookContract", "Hook contract not found: %s" % hook_id)
+		return false
+	
+	# Get metadata
+	var meta_dict = ContractRegistry.get_contract_metadata(hook_id)
+	var metadata = SaveHookMetadata.from_dict(meta_dict)
+	
+	# Validate callback
+	if not callback.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "SaveHookContract", "Invalid callback for hook: %s" % hook_id)
+		return false
+	
+	# Check if already registered
+	if _registered_hooks.has(hook_id):
+		var existing: HookRegistration = _registered_hooks[hook_id]
+		LoggingService.warn(LoggingService.Context.CORE, "SaveHookContract", "Hook '%s' already registered by mod '%s'" % [hook_id, existing.mod_id])
+		return false
+	
+	# Register hook
+	var registration = HookRegistration.new(hook_id, metadata.hook_type, mod_id, callback, metadata.priority)
+	_registered_hooks[hook_id] = registration
+	
+	# Add to type index (maintain sorted order by priority)
+	_hooks_by_type[metadata.hook_type].append(hook_id)
+	_sort_hooks_by_priority(metadata.hook_type)
+	
+	# Add to mod index
+	if not _hooks_by_mod.has(mod_id):
+		_hooks_by_mod[mod_id] = []
+	_hooks_by_mod[mod_id].append(hook_id)
+	
+	var hook_type_name = HookType.keys()[metadata.hook_type]
+	LoggingService.info(LoggingService.Context.CORE, "SaveHookContract", "Registered hook callback: %s [type=%s, mod=%s]" % [hook_id, hook_type_name, mod_id])
+	
+	return true
+
+
+static func unregister_hook_callback(hook_id: String) -> bool:
+	"""
+	Unregister a hook callback.
+	"""
+	if not _registered_hooks.has(hook_id):
+		return false
+	
+	var registration: HookRegistration = _registered_hooks[hook_id]
+	_unregister_hook_internal(registration)
+	
+	LoggingService.info(LoggingService.Context.CORE, "SaveHookContract", "Unregistered hook callback: %s" % hook_id)
+	
+	return true
+
+
+static func unregister_all_hooks_for_mod(mod_id: String) -> int:
+	"""
+	Unregister all hooks for a specific mod.
+	Called when mod unloads.
+	
+	Returns:
+		Number of hooks unregistered
+	"""
+	if not _hooks_by_mod.has(mod_id):
+		return 0
+	
+	var hook_ids = _hooks_by_mod[mod_id].duplicate()
+	var count = 0
+	
+	for hook_id in hook_ids:
+		if unregister_hook_callback(hook_id):
+			count += 1
+	
+	if count > 0:
+		LoggingService.info(LoggingService.Context.CORE, "SaveHookContract", "Unregistered %d hooks for mod '%s'" % [count, mod_id])
+	
+	return count
+
+
+static func _unregister_hook_internal(registration: HookRegistration) -> void:
+	"""
+	Internal hook unregistration logic.
+	"""
+	var hook_id = registration.hook_id
+	var hook_type = registration.hook_type
+	var mod_id = registration.mod_id
+	
+	# Remove from main registry
+	_registered_hooks.erase(hook_id)
+	
+	# Remove from type index
+	_hooks_by_type[hook_type].erase(hook_id)
+	
+	# Remove from mod index
+	if _hooks_by_mod.has(mod_id):
+		_hooks_by_mod[mod_id].erase(hook_id)
+		if _hooks_by_mod[mod_id].is_empty():
+			_hooks_by_mod.erase(mod_id)
+
+
+static func _sort_hooks_by_priority(hook_type: HookType) -> void:
+	"""
+	Sort hooks by priority (lower numbers first).
+	"""
+	var hook_ids = _hooks_by_type[hook_type]
+	
+	hook_ids.sort_custom(func(a, b):
+		var reg_a: HookRegistration = _registered_hooks[a]
+		var reg_b: HookRegistration = _registered_hooks[b]
+		return reg_a.priority < reg_b.priority
+	)
+
+
+## ============================================================================
+## HOOK INVOCATION (CoreMod-facing)
+## ============================================================================
+
+static func invoke_hooks(hook_type: HookType, context: Dictionary = {}) -> Dictionary:
+	"""
+	Invoke all hooks of a specific type.
+	
+	Args:
+		hook_type: Type of hook to invoke
+		context: Opaque context data (Core never interprets this)
+	
+	Returns:
+		Dictionary with invocation results:
+		{
+			"success": bool,
+			"hooks_called": int,
+			"hooks_failed": int,
+			"context": Dictionary (potentially modified by hooks)
+		}
+	"""
+	
+	var result = {
+		"success": true,
+		"hooks_called": 0,
+		"hooks_failed": 0,
+		"context": context.duplicate()
+	}
+	
+	if not _hooks_by_type.has(hook_type):
+		return result
+	
+	var hook_ids = _hooks_by_type[hook_type]
+	var hook_type_name = HookType.keys()[hook_type]
+	
+	LoggingService.debug(LoggingService.Context.CORE, "SaveHookContract", "Invoking %d hooks for: %s" % [hook_ids.size(), hook_type_name])
+	
+	for hook_id in hook_ids:
+		if not _registered_hooks.has(hook_id):
+			continue
+		
+		var registration: HookRegistration = _registered_hooks[hook_id]
+		
+		if not registration.callback.is_valid():
+			LoggingService.error(LoggingService.Context.CORE, "SaveHookContract", "Invalid callback for hook: %s" % hook_id)
+			result["hooks_failed"] += 1
+			result["success"] = false
+			continue
+		
+		# Invoke callback with context
+		var hook_result = registration.callback.call(result["context"])
+		
+		# If callback returns modified context, use it
+		if typeof(hook_result) == TYPE_DICTIONARY:
+			result["context"] = hook_result
+		
+		result["hooks_called"] += 1
+		
+		LoggingService.verbose(LoggingService.Context.CORE, "SaveHookContract", "  ✓ Hook '%s' (mod=%s)" % [hook_id, registration.mod_id])
+	
+	LoggingService.debug(LoggingService.Context.CORE, "SaveHookContract", "Hook invocation complete: %d called, %d failed" % [result["hooks_called"], result["hooks_failed"]])
+	
+	return result
+
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+static func get_hooks_for_type(hook_type: HookType) -> Array[String]:
+	"""
+	Get all registered hook IDs for a specific type.
+	"""
+	if not _hooks_by_type.has(hook_type):
+		return []
+	return _hooks_by_type[hook_type].duplicate()
+
+
+static func get_hooks_for_mod(mod_id: String) -> Array[String]:
+	"""
+	Get all registered hook IDs for a specific mod.
+	"""
+	if not _hooks_by_mod.has(mod_id):
+		return []
+	return _hooks_by_mod[mod_id].duplicate()
+
+
+static func is_hook_registered(hook_id: String) -> bool:
+	"""
+	Check if a hook callback is registered.
+	"""
+	return _registered_hooks.has(hook_id)
+
+
+## ============================================================================
+## VALIDATION
+## ============================================================================
+
+static func validate_save_hook_contract(hook_id: String) -> bool:
+	"""
+	Validate that a save hook contract is properly registered.
+	"""
+	return ContractRegistry.validate_contract_reference(hook_id, ContractRegistry.ContractType.SAVE_HOOK)
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+static func get_version() -> String:
+	return VERSION
+
+
+static func get_all_save_hooks() -> Array[String]:
+	"""
+	Get all registered save hook contracts.
+	"""
+	return ContractRegistry.get_contracts_by_type(ContractRegistry.ContractType.SAVE_HOOK)
+
+
+static func get_save_hooks_for_coremod(coremod_id: String) -> Array[String]:
+	"""
+	Get all save hook contracts for a specific CoreMod.
+	"""
+	return ContractRegistry.get_contracts_by_type_for_coremod(ContractRegistry.ContractType.SAVE_HOOK, coremod_id)
+
+
+static func get_statistics() -> Dictionary:
+	"""
+	Get save hook statistics.
+	"""
+	return {
+		"total_contracts": get_all_save_hooks().size(),
+		"registered_callbacks": _registered_hooks.size(),
+		"pre_save_hooks": get_hooks_for_type(HookType.PRE_SAVE).size(),
+		"post_save_hooks": get_hooks_for_type(HookType.POST_SAVE).size(),
+		"pre_load_hooks": get_hooks_for_type(HookType.PRE_LOAD).size(),
+		"post_load_hooks": get_hooks_for_type(HookType.POST_LOAD).size()
+	}
+
+
+# Initialize static state
+static func _init_static():
+	for hook_type in HookType.values():
+		_hooks_by_type[hook_type] = []
+
+# Call static initializer
+static func __static_constructor():
+	_init_static()
+
+
+res://axiom-runtime-/core/contracts/SaveHookContract.gd.uid
+
+## SaveHookContract.gd.uid
+## Directory: /axiom-runtime-/core/contracts/SaveHookContract.gd.uid
+##
+
+uid://cuud2yhkicg3l
+
+
+res://axiom-runtime-/core/contracts/SystemContract.gd
+
+## SystemContract.gd
+## Directory: /axiom-runtime-/core/contracts/SystemContract.gd
+##
+
+## SystemContract.gd
+## Phase 6: Game Interfaces - System contract definitions
+## Directory: /core/contracts/SystemContract.gd
+##
+## CRITICAL: Defines system contract structure
+## Systems can be extended or overridden if explicitly allowed
+## Core never interprets system logic or semantics
+
+extends RefCounted
+
+const VERSION = "1.0.0"
+
+## System contract metadata structure
+class SystemMetadata:
+	var system_id: String
+	var overrideable: bool  # CRITICAL: Must be explicit
+	var description: String
+	var override_contract: Dictionary  # Details for override interface
+	var dependencies: Array[String]  # Other system IDs this depends on
+	
+	func _init():
+		system_id = ""
+		overrideable = false
+		description = ""
+		override_contract = {}
+		dependencies = []
+	
+	func to_dict() -> Dictionary:
+		return {
+			"system_id": system_id,
+			"overrideable": overrideable,
+			"description": description,
+			"override_contract": override_contract,
+			"dependencies": dependencies
+		}
+	
+	static func from_dict(data: Dictionary) -> SystemMetadata:
+		var meta = SystemMetadata.new()
+		meta.system_id = data.get("system_id", "")
+		meta.overrideable = data.get("overrideable", false)
+		meta.description = data.get("description", "")
+		meta.override_contract = data.get("override_contract", {})
+		meta.dependencies = data.get("dependencies", [])
+		return meta
+
+
+## System override handle - tracks active override
+class SystemOverride:
+	var system_id: String
+	var mod_id: String
+	var handler: Callable
+	var timestamp: int
+	
+	func _init(sys_id: String, mod: String, func_handler: Callable):
+		system_id = sys_id
+		mod_id = mod
+		handler = func_handler
+		timestamp = Time.get_ticks_msec()
+
+
+## Internal override tracking
+static var _active_overrides: Dictionary = {}  # {system_id: SystemOverride}
+
+
+## ============================================================================
+## CONTRACT REGISTRATION HELPERS
+## ============================================================================
+
+static func register_system(coremod_id: String, metadata: SystemMetadata) -> bool:
+	"""
+	Register a system contract with the ContractRegistry.
+	
+	CRITICAL: overrideable flag MUST be set explicitly.
+	
+	Args:
+		coremod_id: ID of the CoreMod registering this system
+		metadata: System metadata
+	
+	Returns:
+		true if registered successfully
+	"""
+	
+	if metadata.system_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "SystemContract", "System ID cannot be empty")
+		return false
+	
+	# Log override capability
+	if metadata.overrideable:
+		LoggingService.info(LoggingService.Context.CORE, "SystemContract", "System '%s' is OVERRIDEABLE" % metadata.system_id)
+	else:
+		LoggingService.info(LoggingService.Context.CORE, "SystemContract", "System '%s' is SEALED" % metadata.system_id)
+	
+	return ContractRegistry.register_contract(
+		metadata.system_id,
+		ContractRegistry.ContractType.SYSTEM,
+		coremod_id,
+		metadata.to_dict()
+	)
+
+
+static func unregister_system(system_id: String) -> bool:
+	"""
+	Unregister a system contract.
+	"""
+	# Clear any active overrides
+	if _active_overrides.has(system_id):
+		_active_overrides.erase(system_id)
+	
+	return ContractRegistry.unregister_contract(system_id)
+
+
+## ============================================================================
+## SYSTEM OVERRIDE (Mod-facing)
+## ============================================================================
+
+static func override_system(system_id: String, mod_id: String, handler: Callable) -> bool:
+	"""
+	Override a system with a mod-provided handler.
+	
+	CRITICAL RULES:
+	- System must be marked overrideable
+	- Override is logged
+	- Only one override active at a time (conflicts must be handled by CoreMod)
+	
+	Args:
+		system_id: Contract ID of the system
+		mod_id: ID of the mod overriding
+		handler: Callable that implements the override
+	
+	Returns:
+		true if override successful
+	"""
+	
+	# Validate contract exists
+	if not ContractRegistry.has_contract(system_id):
+		LoggingService.error(LoggingService.Context.CORE, "SystemContract", "System contract not found: %s" % system_id)
+		return false
+	
+	# Get metadata
+	var meta_dict = ContractRegistry.get_contract_metadata(system_id)
+	var metadata = SystemMetadata.from_dict(meta_dict)
+	
+	# Check if overrideable
+	if not metadata.overrideable:
+		LoggingService.error(LoggingService.Context.CORE, "SystemContract", "System '%s' is NOT overrideable - override denied" % system_id)
+		return false
+	
+	# Check for existing override
+	if _active_overrides.has(system_id):
+		var existing: SystemOverride = _active_overrides[system_id]
+		LoggingService.warn(LoggingService.Context.CORE, "SystemContract", "System '%s' already overridden by mod '%s' - conflict detected" % [system_id, existing.mod_id])
+		# Note: Conflict resolution is CoreMod's responsibility
+		# Core just logs the conflict
+	
+	# Register override
+	var override = SystemOverride.new(system_id, mod_id, handler)
+	_active_overrides[system_id] = override
+	
+	LoggingService.info(LoggingService.Context.CORE, "SystemContract", "System '%s' overridden by mod '%s'" % [system_id, mod_id])
+	
+	return true
+
+
+static func remove_override(system_id: String, mod_id: String) -> bool:
+	"""
+	Remove a system override.
+	"""
+	if not _active_overrides.has(system_id):
+		return false
+	
+	var override: SystemOverride = _active_overrides[system_id]
+	if override.mod_id != mod_id:
+		LoggingService.warn(LoggingService.Context.CORE, "SystemContract", "Cannot remove override - mod mismatch")
+		return false
+	
+	_active_overrides.erase(system_id)
+	LoggingService.info(LoggingService.Context.CORE, "SystemContract", "Removed override for system '%s' by mod '%s'" % [system_id, mod_id])
+	
+	return true
+
+
+static func remove_all_overrides_for_mod(mod_id: String) -> int:
+	"""
+	Remove all overrides by a specific mod.
+	Called when mod unloads.
+	
+	Returns:
+		Number of overrides removed
+	"""
+	var count = 0
+	var to_remove: Array[String] = []
+	
+	for system_id in _active_overrides.keys():
+		var override: SystemOverride = _active_overrides[system_id]
+		if override.mod_id == mod_id:
+			to_remove.append(system_id)
+	
+	for system_id in to_remove:
+		_active_overrides.erase(system_id)
+		count += 1
+	
+	if count > 0:
+		LoggingService.info(LoggingService.Context.CORE, "SystemContract", "Removed %d system overrides for mod '%s'" % [count, mod_id])
+	
+	return count
+
+
+## ============================================================================
+## SYSTEM INVOCATION (CoreMod-facing)
+## ============================================================================
+
+static func invoke_system(system_id: String, args: Array = []) -> Variant:
+	"""
+	Invoke a system.
+	If overridden, calls the override handler.
+	Otherwise, returns null (CoreMod must provide default implementation).
+	
+	Args:
+		system_id: Contract ID of the system
+		args: Arguments to pass to the system
+	
+	Returns:
+		Result from override handler, or null if not overridden
+	"""
+	
+	if _active_overrides.has(system_id):
+		var override: SystemOverride = _active_overrides[system_id]
+		
+		if override.handler.is_valid():
+			return override.handler.callv(args)
+		else:
+			LoggingService.error(LoggingService.Context.CORE, "SystemContract", "Override handler invalid for system: %s" % system_id)
+			return null
+	
+	# No override - CoreMod must handle default
+	return null
+
+
+static func is_system_overridden(system_id: String) -> bool:
+	"""
+	Check if a system is currently overridden.
+	"""
+	return _active_overrides.has(system_id)
+
+
+static func get_override_mod(system_id: String) -> String:
+	"""
+	Get the mod ID that is overriding a system.
+	Returns empty string if not overridden.
+	"""
+	if not _active_overrides.has(system_id):
+		return ""
+	
+	var override: SystemOverride = _active_overrides[system_id]
+	return override.mod_id
+
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+static func is_system_overrideable(system_id: String) -> bool:
+	"""
+	Check if a system can be overridden.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(system_id)
+	if meta_dict.is_empty():
+		return false
+	
+	return meta_dict.get("overrideable", false)
+
+
+static func get_system_description(system_id: String) -> String:
+	"""
+	Get system description.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(system_id)
+	if meta_dict.is_empty():
+		return ""
+	
+	return meta_dict.get("description", "")
+
+
+static func get_system_dependencies(system_id: String) -> Array[String]:
+	"""
+	Get system dependencies.
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(system_id)
+	if meta_dict.is_empty():
+		return []
+	
+	return meta_dict.get("dependencies", [])
+
+
+static func get_override_contract(system_id: String) -> Dictionary:
+	"""
+	Get override contract details (for mod developers).
+	"""
+	var meta_dict = ContractRegistry.get_contract_metadata(system_id)
+	if meta_dict.is_empty():
+		return {}
+	
+	return meta_dict.get("override_contract", {})
+
+
+## ============================================================================
+## VALIDATION
+## ============================================================================
+
+static func validate_system_contract(system_id: String) -> bool:
+	"""
+	Validate that a system contract is properly registered.
+	"""
+	return ContractRegistry.validate_contract_reference(system_id, ContractRegistry.ContractType.SYSTEM)
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+static func get_version() -> String:
+	return VERSION
+
+
+static func get_all_systems() -> Array[String]:
+	"""
+	Get all registered system contracts.
+	"""
+	return ContractRegistry.get_contracts_by_type(ContractRegistry.ContractType.SYSTEM)
+
+
+static func get_systems_for_coremod(coremod_id: String) -> Array[String]:
+	"""
+	Get all system contracts for a specific CoreMod.
+	"""
+	return ContractRegistry.get_contracts_by_type_for_coremod(ContractRegistry.ContractType.SYSTEM, coremod_id)
+
+
+static func get_overrideable_systems() -> Array[String]:
+	"""
+	Get all systems that can be overridden.
+	"""
+	var overrideable: Array[String] = []
+	var all_systems = get_all_systems()
+	
+	for system_id in all_systems:
+		if is_system_overrideable(system_id):
+			overrideable.append(system_id)
+	
+	return overrideable
+
+
+static func get_active_overrides() -> Dictionary:
+	"""
+	Get all active system overrides.
+	Returns: {system_id: mod_id}
+	"""
+	var overrides: Dictionary = {}
+	
+	for system_id in _active_overrides.keys():
+		var override: SystemOverride = _active_overrides[system_id]
+		overrides[system_id] = override.mod_id
+	
+	return overrides
+
+
+res://axiom-runtime-/core/contracts/SystemContract.gd.uid
+
+## SystemContract.gd.uid
+## Directory: /axiom-runtime-/core/contracts/SystemContract.gd.uid
+##
+
+uid://c1qg6bqmc1c2s
+
+

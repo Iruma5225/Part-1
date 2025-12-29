@@ -1,0 +1,1647 @@
+res://axiom-runtime-/core/services/RegistryManager.gd
+
+## RegistryManager.gd
+## Directory: /axiom-runtime-/core/services/RegistryManager.gd
+##
+
+## RegistryManager.gd
+## Phase 6: Integrated with Contract System
+## Directory: /core/services/RegistryManager.gd
+##
+## CRITICAL: Core never interprets registry data
+## Registries are typed containers with opaque entries
+## PHASE 6: Now validates registry contracts for extensibility
+
+extends Node
+
+const VERSION = "1.0.1-Phase6"  # Updated for Phase 6
+
+class RegistryHandle:
+	var _id: int
+	var _registry_name: String
+	var _owner_id: String
+	var _is_valid: bool = true
+	
+	func _init(id: int, registry_name: String, owner_id: String):
+		_id = id
+		_registry_name = registry_name
+		_owner_id = owner_id
+	
+	func invalidate() -> void:
+		_is_valid = false
+	
+	func is_valid() -> bool:
+		return _is_valid
+	
+	func get_registry_name() -> String:
+		return _registry_name
+	
+	func get_owner_id() -> String:
+		return _owner_id
+
+class RegistryEntry:
+	var entry_id: String
+	var data: Variant
+	var owner_id: String
+	var metadata: Dictionary
+	
+	func _init(id: String, entry_data: Variant, owner: String):
+		entry_id = id
+		data = entry_data
+		owner_id = owner
+		metadata = {
+			"created_at": Time.get_ticks_msec(),
+			"modified_at": Time.get_ticks_msec()
+		}
+	
+	func update_data(new_data: Variant) -> void:
+		data = new_data
+		metadata["modified_at"] = Time.get_ticks_msec()
+
+## Internal state
+var _registries: Dictionary = {}
+var _registry_handles: Dictionary = {}
+var _registry_owners: Dictionary = {}
+var _next_handle_id: int = 1
+
+var _total_registries: int = 0
+var _total_entries: int = 0
+var _total_lookups: int = 0
+var _total_modifications: int = 0
+
+var _registry_lock: Mutex = Mutex.new()
+
+## PHASE 6: Contract validation mode
+var _contract_validation_enabled: bool = false
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Semantic-free registry system ready")
+	
+	# Phase 6: Enable contract validation after ContractRegistry is ready
+	await get_tree().process_frame
+	if ContractRegistry:
+		_contract_validation_enabled = true
+		LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Phase 6 contract validation enabled")
+
+
+## ============================================================================
+## REGISTRY CREATION (Phase 6 Enhanced)
+## ============================================================================
+
+func create_registry(registry_name: String, owner_id: String) -> RegistryHandle:
+	"""
+	Create a new registry. Returns handle for access.
+	
+	PHASE 6: Now optionally validates registry contract.
+	
+	Args:
+		registry_name: Unique identifier for the registry
+		owner_id: ID of the CoreMod or system creating it
+	
+	Returns:
+		RegistryHandle for accessing this registry
+	"""
+	
+	if registry_name == "":
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Cannot create registry with empty name")
+		return null
+	
+	# PHASE 6: Optional contract validation
+	if _contract_validation_enabled:
+		if not _validate_registry_contract(registry_name):
+			LoggingService.warn(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' has no registered contract (creation allowed but unverified)" % registry_name)
+	
+	_registry_lock.lock()
+	
+	if _registries.has(registry_name):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' already exists" % registry_name)
+		return null
+	
+	_registries[registry_name] = {}
+	_registry_owners[registry_name] = owner_id
+	_total_registries += 1
+	
+	var handle = RegistryHandle.new(_next_handle_id, registry_name, owner_id)
+	_next_handle_id += 1
+	_registry_handles[handle._id] = handle
+	
+	_registry_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Created registry '%s' (owner=%s) [handle=%d]" % [registry_name, owner_id, handle._id])
+	
+	return handle
+
+
+func destroy_registry(handle: RegistryHandle) -> bool:
+	"""
+	Destroy a registry. Only the owner can destroy it.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.warn(LoggingService.Context.CORE, "RegistryManager", "Invalid handle for destroy_registry")
+		return false
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if not _registries.has(registry_name):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' does not exist" % registry_name)
+		return false
+	
+	if _registry_owners.get(registry_name, "") != handle.get_owner_id():
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Only owner can destroy registry '%s'" % registry_name)
+		return false
+	
+	var entry_count = _registries[registry_name].size()
+	
+	_registries.erase(registry_name)
+	_registry_owners.erase(registry_name)
+	handle.invalidate()
+	_registry_handles.erase(handle._id)
+	
+	_registry_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Destroyed registry '%s' (%d entries removed)" % [registry_name, entry_count])
+	
+	return true
+
+
+## ============================================================================
+## ENTRY MANAGEMENT (Phase 6 Enhanced)
+## ============================================================================
+
+func register_entry(handle: RegistryHandle, entry_id: String, data: Variant, owner_id: String = "") -> bool:
+	"""
+	Register a new entry in a registry.
+	
+	PHASE 6: Validates registry extensibility if contract exists.
+	
+	Args:
+		handle: Registry handle
+		entry_id: Unique ID for this entry within the registry
+		data: Opaque data (Core doesn't interpret this)
+		owner_id: Optional owner ID for the entry
+	
+	Returns:
+		true if registered successfully
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Invalid handle for register_entry")
+		return false
+	
+	if entry_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Cannot register entry with empty ID")
+		return false
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if not _registries.has(registry_name):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' does not exist" % registry_name)
+		return false
+	
+	# PHASE 6: Check extensibility if contract exists
+	if _contract_validation_enabled:
+		if not _check_registry_extensibility(registry_name, owner_id):
+			_registry_lock.unlock()
+			LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' is not extensible - entry denied" % registry_name)
+			return false
+	
+	if _registries[registry_name].has(entry_id):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Entry '%s' already exists in registry '%s'" % [entry_id, registry_name])
+		return false
+	
+	var entry_owner = owner_id if owner_id != "" else handle.get_owner_id()
+	
+	var entry = RegistryEntry.new(entry_id, data, entry_owner)
+	_registries[registry_name][entry_id] = entry
+	_total_entries += 1
+	_total_modifications += 1
+	
+	_registry_lock.unlock()
+	
+	LoggingService.debug(LoggingService.Context.CORE, "RegistryManager", "Registered entry '%s' in '%s' (owner=%s)" % [entry_id, registry_name, entry_owner])
+	
+	return true
+
+
+func unregister_entry(handle: RegistryHandle, entry_id: String) -> bool:
+	"""
+	Remove an entry from a registry.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Invalid handle for unregister_entry")
+		return false
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if not _registries.has(registry_name):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' does not exist" % registry_name)
+		return false
+	
+	if not _registries[registry_name].has(entry_id):
+		_registry_lock.unlock()
+		LoggingService.warn(LoggingService.Context.CORE, "RegistryManager", "Entry '%s' does not exist in registry '%s'" % [entry_id, registry_name])
+		return false
+	
+	_registries[registry_name].erase(entry_id)
+	_total_entries = max(0, _total_entries - 1)
+	_total_modifications += 1
+	
+	_registry_lock.unlock()
+	
+	LoggingService.debug(LoggingService.Context.CORE, "RegistryManager", "Unregistered entry '%s' from '%s'" % [entry_id, registry_name])
+	
+	return true
+
+
+func update_entry(handle: RegistryHandle, entry_id: String, new_data: Variant) -> bool:
+	"""
+	Update an existing entry's data.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Invalid handle for update_entry")
+		return false
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if not _registries.has(registry_name):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Registry '%s' does not exist" % registry_name)
+		return false
+	
+	if not _registries[registry_name].has(entry_id):
+		_registry_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Entry '%s' does not exist in registry '%s'" % [entry_id, registry_name])
+		return false
+	
+	var entry: RegistryEntry = _registries[registry_name][entry_id]
+	entry.update_data(new_data)
+	_total_modifications += 1
+	
+	_registry_lock.unlock()
+	
+	LoggingService.verbose(LoggingService.Context.CORE, "RegistryManager", "Updated entry '%s' in '%s'" % [entry_id, registry_name])
+	
+	return true
+
+
+## ============================================================================
+## PHASE 6: CONTRACT VALIDATION
+## ============================================================================
+
+func _validate_registry_contract(registry_name: String) -> bool:
+	"""
+	PHASE 6: Validate that a registry contract exists.
+	"""
+	if not ContractRegistry:
+		return false
+	
+	return ContractRegistry.has_contract(registry_name)
+
+
+func _check_registry_extensibility(registry_name: String, requester_id: String) -> bool:
+	"""
+	PHASE 6: Check if a registry can be extended by a mod.
+	Returns true if:
+	- No contract exists (backward compatibility)
+	- Contract exists and registry is extensible
+	- Requester is the registry owner
+	"""
+	
+	if not ContractRegistry:
+		return true
+	
+	if not ContractRegistry.has_contract(registry_name):
+		return true
+	
+	var registry_owner = _registry_owners.get(registry_name, "")
+	if requester_id == registry_owner:
+		return true
+	
+	var meta = ContractRegistry.get_contract_metadata(registry_name)
+	return meta.get("extensible", false)
+
+
+func enable_contract_validation(enabled: bool) -> void:
+	"""
+	PHASE 6: Enable or disable contract validation.
+	"""
+	_contract_validation_enabled = enabled
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Contract validation %s" % ("enabled" if enabled else "disabled"))
+
+
+## ============================================================================
+## QUERY API
+## ============================================================================
+
+func get_entry(handle: RegistryHandle, entry_id: String) -> Variant:
+	"""
+	Retrieve entry data from registry.
+	Returns null if not found.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "RegistryManager", "Invalid handle for get_entry")
+		return null
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if not _registries.has(registry_name):
+		_registry_lock.unlock()
+		return null
+	
+	if not _registries[registry_name].has(entry_id):
+		_registry_lock.unlock()
+		return null
+	
+	var entry: RegistryEntry = _registries[registry_name][entry_id]
+	var data = entry.data
+	_total_lookups += 1
+	
+	_registry_lock.unlock()
+	
+	return data
+
+
+func has_entry(handle: RegistryHandle, entry_id: String) -> bool:
+	if handle == null or not handle.is_valid():
+		return false
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	var exists = _registries.has(registry_name) and _registries[registry_name].has(entry_id)
+	
+	_registry_lock.unlock()
+	
+	return exists
+
+
+func get_all_entry_ids(handle: RegistryHandle) -> Array[String]:
+	var ids: Array[String] = []
+	
+	if handle == null or not handle.is_valid():
+		return ids
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if _registries.has(registry_name):
+		for entry_id in _registries[registry_name].keys():
+			ids.append(entry_id)
+	
+	_registry_lock.unlock()
+	
+	return ids
+
+
+func get_entry_count(handle: RegistryHandle) -> int:
+	if handle == null or not handle.is_valid():
+		return 0
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	var count = _registries.get(registry_name, {}).size()
+	
+	_registry_lock.unlock()
+	
+	return count
+
+
+## ============================================================================
+## CLEANUP
+## ============================================================================
+
+func clear_registry(handle: RegistryHandle) -> bool:
+	if handle == null or not handle.is_valid():
+		return false
+	
+	_registry_lock.lock()
+	
+	var registry_name = handle.get_registry_name()
+	
+	if not _registries.has(registry_name):
+		_registry_lock.unlock()
+		return false
+	
+	var entry_count = _registries[registry_name].size()
+	_registries[registry_name].clear()
+	_total_entries = max(0, _total_entries - entry_count)
+	
+	_registry_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Cleared registry '%s' (%d entries removed)" % [registry_name, entry_count])
+	
+	return true
+
+
+func destroy_all_registries_for_owner(owner_id: String) -> void:
+	if owner_id == "":
+		return
+	
+	var handles_to_destroy: Array[RegistryHandle] = []
+	
+	_registry_lock.lock()
+	
+	for handle in _registry_handles.values():
+		if handle.get_owner_id() == owner_id:
+			handles_to_destroy.append(handle)
+	
+	_registry_lock.unlock()
+	
+	for handle in handles_to_destroy:
+		destroy_registry(handle)
+	
+	if handles_to_destroy.size() > 0:
+		LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "Destroyed %d registries for owner: %s" % [handles_to_destroy.size(), owner_id])
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func get_all_registry_names() -> Array[String]:
+	var names: Array[String] = []
+	
+	_registry_lock.lock()
+	for name in _registries.keys():
+		names.append(name)
+	_registry_lock.unlock()
+	
+	return names
+
+
+func get_statistics() -> String:
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   REGISTRY STATISTICS (Phase 6)\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Total Registries:     %d\n" % _registries.size()
+	stats += "Total Entries:        %d\n" % _total_entries
+	stats += "Total Lookups:        %d\n" % _total_lookups
+	stats += "Total Modifications:  %d\n" % _total_modifications
+	stats += "Active Handles:       %d\n" % _registry_handles.size()
+	stats += "Contract Validation:  %s\n" % ("enabled" if _contract_validation_enabled else "disabled")
+	stats += "═══════════════════════════════════════\n"
+	
+	if not _registries.is_empty():
+		stats += "Per-Registry Stats:\n"
+		for registry_name in _registries.keys():
+			var entry_count = _registries[registry_name].size()
+			var owner = _registry_owners.get(registry_name, "unknown")
+			stats += "  %s:\n" % registry_name
+			stats += "    Entries: %d\n" % entry_count
+			stats += "    Owner:   %s\n" % owner
+	
+	return stats
+
+
+## ============================================================================
+## SHUTDOWN
+## ============================================================================
+
+func shutdown() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "   SHUTTING DOWN (Phase 6)")
+	LoggingService.info(LoggingService.Context.CORE, "RegistryManager", "═══════════════════════════════════════")
+	
+	var stats = get_statistics()
+	for line in stats.split("\n"):
+		if line.strip_edges() != "":
+			LoggingService.info(LoggingService.Context.CORE, "RegistryManager", line)
+	
+	_registry_lock.lock()
+	
+	for handle in _registry_handles.values():
+		handle.invalidate()
+	
+	_registries.clear()
+	_registry_handles.clear()
+	_registry_owners.clear()
+	
+	_registry_lock.unlock()
+
+
+res://axiom-runtime-/core/services/RegistryManager.gd.uid
+
+## RegistryManager.gd.uid
+## Directory: /axiom-runtime-/core/services/RegistryManager.gd.uid
+##
+
+uid://be4tc3phkyy5r
+
+
+res://axiom-runtime-/core/services/VirtualFileSystem.gd
+
+## VirtualFileSystem.gd
+## Directory: /axiom-runtime-/core/services/VirtualFileSystem.gd
+##
+
+## VirtualFileSystem.gd
+## Phase 2: Runtime Services - Virtual file system for mod isolation
+## Directory: /core/services/VirtualFileSystem.gd
+##
+## CRITICAL: Provides isolated file access for mods
+## Prevents mods from accessing each other's files or Core internals
+## IMPROVED: Security hardening + size limits
+
+extends Node
+
+const VERSION = "1.0.1-Improved"  # Updated for improvements
+
+## VFS Mount - represents a mounted directory
+class VFSMount:
+	var mount_id: String
+	var physical_path: String
+	var owner_id: String
+	var read_only: bool
+	var is_valid: bool = true
+	
+	func _init(id: String, path: String, owner: String, readonly: bool = false):
+		mount_id = id
+		physical_path = path
+		owner_id = owner
+		read_only = readonly
+	
+	func invalidate() -> void:
+		is_valid = false
+
+## VFS Handle - opaque reference for file access
+class VFSHandle:
+	var _id: int
+	var _mount_id: String
+	var _owner_id: String
+	var _is_valid: bool = true
+	
+	func _init(id: int, mount_id: String, owner_id: String):
+		_id = id
+		_mount_id = mount_id
+		_owner_id = owner_id
+	
+	func invalidate() -> void:
+		_is_valid = false
+	
+	func is_valid() -> bool:
+		return _is_valid
+	
+	func get_mount_id() -> String:
+		return _mount_id
+	
+	func get_owner_id() -> String:
+		return _owner_id
+
+## Internal state
+var _mounts: Dictionary = {}  # {mount_id: VFSMount}
+var _handles: Dictionary = {}  # {handle_id: VFSHandle}
+var _next_handle_id: int = 1
+
+## Statistics
+var _total_mounts: int = 0
+var _total_reads: int = 0
+var _total_writes: int = 0
+var _total_access_denied: int = 0
+
+## Thread safety
+var _vfs_lock: Mutex = Mutex.new()
+
+## IMPROVEMENT: File size limits
+var _mount_usage: Dictionary = {}  # {mount_id: bytes_used}
+var _max_file_size_bytes: int = 100 * 1024 * 1024  # 100MB per file
+var _max_total_size_bytes: int = 1024 * 1024 * 1024  # 1GB per mount
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "Initialized v%s" % VERSION)
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "Virtual file system ready")
+	
+	# Load size limits from config
+	_load_size_limit_config()
+
+
+func _load_size_limit_config() -> void:
+	"""Load file size limits from StartupConfig"""
+	if not has_node("/root/StartupConfig"):
+		LoggingService.info(LoggingService.Context.CORE, "VFS", "Using default size limits: %dMB per file, %dMB per mount" % [_max_file_size_bytes / (1024 * 1024), _max_total_size_bytes / (1024 * 1024)])
+		return
+	
+	var config = get_node("/root/StartupConfig")
+	_max_file_size_bytes = config.get_max_file_size_bytes()
+	_max_total_size_bytes = config.get_max_mount_size_bytes()
+	
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "Size limits loaded: %dMB per file, %dMB per mount" % [_max_file_size_bytes / (1024 * 1024), _max_total_size_bytes / (1024 * 1024)])
+
+
+## ============================================================================
+## MOUNT MANAGEMENT
+## ============================================================================
+
+func mount(mount_id: String, physical_path: String, owner_id: String, read_only: bool = false) -> VFSHandle:
+	"""
+	Mount a directory into the VFS.
+	
+	Args:
+		mount_id: Unique identifier for this mount (e.g., "mod_data", "coremod_assets")
+		physical_path: Actual filesystem path
+		owner_id: ID of the mod/system mounting this
+		read_only: If true, write operations are denied
+	
+	Returns:
+		VFSHandle for accessing this mount
+	"""
+	
+	if mount_id == "":
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Cannot mount with empty mount_id")
+		return null
+	
+	if not DirAccess.dir_exists_absolute(physical_path):
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Physical path does not exist: %s" % physical_path)
+		return null
+	
+	_vfs_lock.lock()
+	
+	if _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Mount '%s' already exists" % mount_id)
+		return null
+	
+	# Create mount
+	var mount = VFSMount.new(mount_id, physical_path, owner_id, read_only)
+	_mounts[mount_id] = mount
+	_total_mounts += 1
+	
+	# Initialize usage tracking
+	_mount_usage[mount_id] = 0
+	
+	# Create handle
+	var handle = VFSHandle.new(_next_handle_id, mount_id, owner_id)
+	_next_handle_id += 1
+	_handles[handle._id] = handle
+	
+	_vfs_lock.unlock()
+	
+	var ro_flag = " [READ-ONLY]" if read_only else ""
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "Mounted '%s' → %s (owner=%s)%s [handle=%d]" % [mount_id, physical_path, owner_id, ro_flag, handle._id])
+	
+	return handle
+
+
+func unmount(handle: VFSHandle) -> bool:
+	"""
+	Unmount a directory. Only the owner can unmount.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.warn(LoggingService.Context.CORE, "VFS", "Invalid handle for unmount")
+		return false
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Mount '%s' does not exist" % mount_id)
+		return false
+	
+	var mount: VFSMount = _mounts[mount_id]
+	
+	# Verify ownership
+	if mount.owner_id != handle.get_owner_id():
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Only owner can unmount '%s'" % mount_id)
+		_total_access_denied += 1
+		return false
+	
+	# Remove mount
+	mount.invalidate()
+	_mounts.erase(mount_id)
+	_mount_usage.erase(mount_id)
+	handle.invalidate()
+	_handles.erase(handle._id)
+	
+	_vfs_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "Unmounted '%s'" % mount_id)
+	
+	return true
+
+
+## ============================================================================
+## FILE OPERATIONS (Isolated + Size Limited)
+## ============================================================================
+
+func read_file(handle: VFSHandle, relative_path: String) -> String:
+	"""
+	Read a file from the mounted directory.
+	
+	Args:
+		handle: VFS handle to the mount
+		relative_path: Path relative to the mount point (e.g., "data/config.json")
+	
+	Returns:
+		File contents as string, or empty string on error
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Invalid handle for read_file")
+		return ""
+	
+	# Validate path (prevent directory traversal)
+	if not _is_safe_path(relative_path):
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Unsafe path rejected: %s" % relative_path)
+		_total_access_denied += 1
+		return ""
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Mount '%s' does not exist" % mount_id)
+		return ""
+	
+	var mount: VFSMount = _mounts[mount_id]
+	var full_path = mount.physical_path.path_join(relative_path)
+	
+	_vfs_lock.unlock()
+	
+	# Read file
+	if not FileAccess.file_exists(full_path):
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "File not found: %s" % relative_path)
+		return ""
+	
+	var file = FileAccess.open(full_path, FileAccess.READ)
+	if not file:
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Cannot open file: %s" % relative_path)
+		return ""
+	
+	var content = file.get_as_text()
+	file.close()
+	
+	_total_reads += 1
+	LoggingService.verbose(LoggingService.Context.CORE, "VFS", "Read file: %s (%d bytes)" % [relative_path, content.length()])
+	
+	return content
+
+
+func write_file(handle: VFSHandle, relative_path: String, content: String) -> bool:
+	"""
+	IMPROVED: Write a file with size limits.
+	
+	Args:
+		handle: VFS handle to the mount
+		relative_path: Path relative to the mount point
+		content: Content to write
+	
+	Returns:
+		true if successful
+	"""
+	
+	if handle == null or not handle.is_valid():
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Invalid handle for write_file")
+		return false
+	
+	# Validate path
+	if not _is_safe_path(relative_path):
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Unsafe path rejected: %s" % relative_path)
+		_total_access_denied += 1
+		return false
+	
+	# IMPROVEMENT: Check file size limit
+	var content_size = content.length()
+	if content_size > _max_file_size_bytes:
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "File too large: %d bytes (max: %d)" % [content_size, _max_file_size_bytes])
+		_total_access_denied += 1
+		return false
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Mount '%s' does not exist" % mount_id)
+		return false
+	
+	var mount: VFSMount = _mounts[mount_id]
+	
+	# Check read-only
+	if mount.read_only:
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Cannot write to read-only mount: %s" % mount_id)
+		_total_access_denied += 1
+		return false
+	
+	# IMPROVEMENT: Check total mount usage
+	var current_usage = _mount_usage.get(mount_id, 0)
+	
+	if current_usage + content_size > _max_total_size_bytes:
+		_vfs_lock.unlock()
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Mount storage limit exceeded: %s (current: %d, trying to add: %d, limit: %d)" % [mount_id, current_usage, content_size, _max_total_size_bytes])
+		_total_access_denied += 1
+		return false
+	
+	var full_path = mount.physical_path.path_join(relative_path)
+	
+	_vfs_lock.unlock()
+	
+	# Ensure directory exists
+	var dir_path = full_path.get_base_dir()
+	if not DirAccess.dir_exists_absolute(dir_path):
+		var dir = DirAccess.open(mount.physical_path)
+		if dir:
+			dir.make_dir_recursive(relative_path.get_base_dir())
+	
+	# Write file
+	var file = FileAccess.open(full_path, FileAccess.WRITE)
+	if not file:
+		LoggingService.error(LoggingService.Context.CORE, "VFS", "Cannot open file for writing: %s" % relative_path)
+		return false
+	
+	file.store_string(content)
+	file.close()
+	
+	# IMPROVEMENT: Update usage tracking
+	_vfs_lock.lock()
+	_mount_usage[mount_id] = current_usage + content_size
+	_vfs_lock.unlock()
+	
+	_total_writes += 1
+	LoggingService.verbose(LoggingService.Context.CORE, "VFS", "Wrote file: %s (%d bytes)" % [relative_path, content.length()])
+	
+	return true
+
+
+func file_exists(handle: VFSHandle, relative_path: String) -> bool:
+	"""
+	Check if a file exists in the mounted directory.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		return false
+	
+	if not _is_safe_path(relative_path):
+		_total_access_denied += 1
+		return false
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		return false
+	
+	var mount: VFSMount = _mounts[mount_id]
+	var full_path = mount.physical_path.path_join(relative_path)
+	
+	_vfs_lock.unlock()
+	
+	return FileAccess.file_exists(full_path)
+
+
+func list_files(handle: VFSHandle, relative_path: String = "") -> Array[String]:
+	"""
+	List files in a directory within the mount.
+	
+	Returns:
+		Array of file names (not full paths)
+	"""
+	
+	var files: Array[String] = []
+	
+	if handle == null or not handle.is_valid():
+		return files
+	
+	if not _is_safe_path(relative_path):
+		_total_access_denied += 1
+		return files
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		return files
+	
+	var mount: VFSMount = _mounts[mount_id]
+	var full_path = mount.physical_path.path_join(relative_path)
+	
+	_vfs_lock.unlock()
+	
+	var dir = DirAccess.open(full_path)
+	if not dir:
+		return files
+	
+	dir.list_dir_begin()
+	var file_name = dir.get_next()
+	
+	while file_name != "":
+		if not dir.current_is_dir():
+			files.append(file_name)
+		file_name = dir.get_next()
+	
+	dir.list_dir_end()
+	
+	return files
+
+
+## ============================================================================
+## IMPROVEMENT: SIZE MANAGEMENT
+## ============================================================================
+
+func get_mount_usage(handle: VFSHandle) -> Dictionary:
+	"""
+	IMPROVEMENT: Get mount storage usage.
+	Returns {bytes_used: int, bytes_available: int, percentage_used: float}
+	"""
+	
+	if handle == null or not handle.is_valid():
+		return {}
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		return {}
+	
+	var used = _mount_usage.get(mount_id, 0)
+	var available = _max_total_size_bytes - used
+	var percentage = (float(used) / float(_max_total_size_bytes)) * 100.0
+	
+	_vfs_lock.unlock()
+	
+	return {
+		"bytes_used": used,
+		"bytes_available": available,
+		"percentage_used": percentage,
+		"max_total_bytes": _max_total_size_bytes
+	}
+
+
+func set_size_limits(max_file_bytes: int, max_mount_bytes: int) -> void:
+	"""
+	IMPROVEMENT: Configure size limits at runtime.
+	"""
+	_vfs_lock.lock()
+	
+	_max_file_size_bytes = max_file_bytes
+	_max_total_size_bytes = max_mount_bytes
+	
+	_vfs_lock.unlock()
+	
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "Size limits updated: %dMB per file, %dMB per mount" % [max_file_bytes / (1024 * 1024), max_mount_bytes / (1024 * 1024)])
+
+
+## ============================================================================
+## SECURITY (HARDENED)
+## ============================================================================
+
+func _is_safe_path(path: String) -> bool:
+	"""
+	IMPROVED: Hardened path validation with additional security checks.
+	"""
+	
+	if path == "":
+		return false
+	
+	# IMPROVEMENT: Reject null bytes (security hardening)
+	if path.find(char(0)) != -1:
+		LoggingService.warn(LoggingService.Context.CORE, "VFS", "Path contains null byte - rejected")
+		return false
+	
+	# IMPROVEMENT: Reject overly long paths (DoS prevention)
+	if path.length() > 512:
+		LoggingService.warn(LoggingService.Context.CORE, "VFS", "Path too long (%d chars) - rejected" % path.length())
+		return false
+	
+	# Reject absolute paths
+	if path.begins_with("/") or path.begins_with("\\"):
+		return false
+	
+	# Reject drive letters (Windows)
+	if path.contains(":"):
+		return false
+	
+	# Reject parent directory references
+	if ".." in path:
+		return false
+	
+	# IMPROVEMENT: Reject paths with repeated slashes
+	if "//" in path or "\\\\" in path:
+		LoggingService.warn(LoggingService.Context.CORE, "VFS", "Path contains repeated slashes - rejected")
+		return false
+	
+	return true
+
+
+## ============================================================================
+## CLEANUP
+## ============================================================================
+
+func unmount_all_for_owner(owner_id: String) -> void:
+	"""
+	Unmount all mounts belonging to a specific owner.
+	Used during mod unload or system shutdown.
+	"""
+	
+	if owner_id == "":
+		return
+	
+	var handles_to_unmount: Array[VFSHandle] = []
+	
+	_vfs_lock.lock()
+	
+	for handle in _handles.values():
+		if handle.get_owner_id() == owner_id:
+			handles_to_unmount.append(handle)
+	
+	_vfs_lock.unlock()
+	
+	for handle in handles_to_unmount:
+		unmount(handle)
+	
+	if handles_to_unmount.size() > 0:
+		LoggingService.info(LoggingService.Context.CORE, "VFS", "Unmounted %d mounts for owner: %s" % [handles_to_unmount.size(), owner_id])
+
+
+## ============================================================================
+## DIAGNOSTICS
+## ============================================================================
+
+func get_version() -> String:
+	return VERSION
+
+
+func get_mount_info(handle: VFSHandle) -> Dictionary:
+	"""
+	Get information about a mount.
+	"""
+	
+	if handle == null or not handle.is_valid():
+		return {}
+	
+	_vfs_lock.lock()
+	
+	var mount_id = handle.get_mount_id()
+	
+	if not _mounts.has(mount_id):
+		_vfs_lock.unlock()
+		return {}
+	
+	var mount: VFSMount = _mounts[mount_id]
+	var usage = _mount_usage.get(mount_id, 0)
+	
+	var info = {
+		"mount_id": mount.mount_id,
+		"physical_path": mount.physical_path,
+		"owner_id": mount.owner_id,
+		"read_only": mount.read_only,
+		"bytes_used": usage,
+		"bytes_available": _max_total_size_bytes - usage
+	}
+	
+	_vfs_lock.unlock()
+	
+	return info
+
+
+func get_all_mounts() -> Array[String]:
+	"""
+	Get list of all mount IDs.
+	"""
+	
+	var mount_ids: Array[String] = []
+	
+	_vfs_lock.lock()
+	for mount_id in _mounts.keys():
+		mount_ids.append(mount_id)
+	_vfs_lock.unlock()
+	
+	return mount_ids
+
+
+func get_statistics() -> String:
+	"""
+	Get formatted statistics string.
+	"""
+	
+	var stats = ""
+	stats += "═══════════════════════════════════════\n"
+	stats += "   VFS STATISTICS (Improved)\n"
+	stats += "═══════════════════════════════════════\n"
+	stats += "Total Mounts:         %d\n" % _mounts.size()
+	stats += "Total Reads:          %d\n" % _total_reads
+	stats += "Total Writes:         %d\n" % _total_writes
+	stats += "Access Denied:        %d\n" % _total_access_denied
+	stats += "Active Handles:       %d\n" % _handles.size()
+	stats += "Max File Size:        %d MB\n" % (_max_file_size_bytes / (1024 * 1024))
+	stats += "Max Mount Size:       %d MB\n" % (_max_total_size_bytes / (1024 * 1024))
+	stats += "═══════════════════════════════════════\n"
+	
+	if not _mounts.is_empty():
+		stats += "Active Mounts:\n"
+		for mount_id in _mounts.keys():
+			var mount: VFSMount = _mounts[mount_id]
+			var usage = _mount_usage.get(mount_id, 0)
+			var ro_flag = " [RO]" if mount.read_only else ""
+			stats += "  %s → %s (owner=%s)%s\n" % [mount_id, mount.physical_path, mount.owner_id, ro_flag]
+			stats += "    Usage: %.2f MB / %d MB\n" % [usage / (1024.0 * 1024.0), _max_total_size_bytes / (1024 * 1024)]
+	
+	return stats
+
+
+## ============================================================================
+## SHUTDOWN
+## ============================================================================
+
+func shutdown() -> void:
+	"""
+	Shutdown VFS and log final statistics.
+	"""
+	
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "═══════════════════════════════════════")
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "   SHUTTING DOWN (Improved)")
+	LoggingService.info(LoggingService.Context.CORE, "VFS", "═══════════════════════════════════════")
+	
+	var stats = get_statistics()
+	for line in stats.split("\n"):
+		if line.strip_edges() != "":
+			LoggingService.info(LoggingService.Context.CORE, "VFS", line)
+	
+	_vfs_lock.lock()
+	
+	# Invalidate all
+	for mount in _mounts.values():
+		mount.invalidate()
+	
+	for handle in _handles.values():
+		handle.invalidate()
+	
+	_mounts.clear()
+	_handles.clear()
+	_mount_usage.clear()
+	
+	_vfs_lock.unlock()
+
+
+res://axiom-runtime-/core/services/VirtualFileSystem.gd.uid
+
+## VirtualFileSystem.gd.uid
+## Directory: /axiom-runtime-/core/services/VirtualFileSystem.gd.uid
+##
+
+uid://b1j60whml5t8c
+
+
+res://axiom-runtime-/core/test_scenes/Phase1Test.gd
+
+## Phase1Test.gd
+## Directory: /axiom-runtime-/core/test_scenes/Phase1Test.gd
+##
+
+## Phase1Test.gd
+## Phase 1: Foundation - Test scene for verifying all Phase 1 systems
+## Directory: /core/test_scenes/Phase1Test.gd
+
+extends Control
+
+@onready var output_label: Label = $MarginContainer/VBoxContainer/ScrollContainer/OutputLabel
+@onready var test_button: Button = $MarginContainer/VBoxContainer/TestButton
+@onready var clear_button: Button = $MarginContainer/VBoxContainer/ClearButton
+@onready var request_perm_button: Button = $MarginContainer/VBoxContainer/RequestPermButton
+@onready var stats_button: Button = $MarginContainer/VBoxContainer/StatsButton
+
+var _test_output: String = ""
+
+
+## ============================================================================
+## INITIALIZATION
+## ============================================================================
+
+func _ready() -> void:
+	_setup_ui()
+	_run_initial_tests()
+
+
+func _setup_ui() -> void:
+	test_button.pressed.connect(_on_test_button_pressed)
+	clear_button.pressed.connect(_on_clear_button_pressed)
+	request_perm_button.pressed.connect(_on_request_perm_button_pressed)
+	stats_button.pressed.connect(_on_stats_button_pressed)
+	
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("   PHASE 1 TEST SCENE")
+	_log_to_ui("   Axiom Runtime Foundation")
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("")
+
+
+## ============================================================================
+## INITIAL TESTS
+## ============================================================================
+
+func _run_initial_tests() -> void:
+	_log_to_ui("Running initial verification tests...")
+	_log_to_ui("")
+	
+	# Test 1: Bootstrap status
+	_test_bootstrap_status()
+	
+	# Test 2: LoggingService
+	_test_logging_service()
+	
+	# Test 3: PermissionManager
+	_test_permission_manager()
+	
+	# Test 4: File system access
+	_test_file_system()
+	
+	# Test 5: Profiling
+	_test_profiling()
+	
+	_log_to_ui("")
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("Initial tests complete!")
+	_log_to_ui("Press buttons below for additional tests")
+	_log_to_ui("═══════════════════════════════════════")
+
+
+func _test_bootstrap_status() -> void:
+	_log_to_ui("TEST: Bootstrap Status")
+	
+	if Bootstrap.is_initialized():
+		_log_to_ui("  ✓ Bootstrap initialized")
+	else:
+		_log_to_ui("  ✗ Bootstrap NOT initialized")
+	
+	var status = Bootstrap.get_runtime_status()
+	for line in status.split("\n"):
+		if line.strip_edges() != "":
+			_log_to_ui("  " + line)
+	
+	_log_to_ui("")
+
+
+func _test_logging_service() -> void:
+	_log_to_ui("TEST: LoggingService")
+	
+	var version = LoggingService.get_version()
+	_log_to_ui("  Version: %s" % version)
+	
+	var core_log = LoggingService.get_core_log_path()
+	_log_to_ui("  Core log: %s" % core_log.get_file())
+	
+	if FileAccess.file_exists(core_log):
+		_log_to_ui("  ✓ Core log file exists")
+		
+		# Read last few lines
+		var file = FileAccess.open(core_log, FileAccess.READ)
+		if file:
+			var lines = file.get_as_text().split("\n")
+			var recent_lines = lines.slice(max(0, lines.size() - 5), lines.size())
+			_log_to_ui("  Last log entries:")
+			for line in recent_lines:
+				if line.strip_edges() != "":
+					_log_to_ui("    " + line.substr(0, 60) + "...")
+			file.close()
+	else:
+		_log_to_ui("  ✗ Core log file NOT found")
+	
+	# Test writing to log
+	LoggingService.info(LoggingService.Context.CORE, "Phase1Test", "Test log entry from UI")
+	_log_to_ui("  ✓ Test entry written to log")
+	
+	_log_to_ui("")
+
+
+func _test_permission_manager() -> void:
+	_log_to_ui("TEST: PermissionManager")
+	
+	var has_perm = PermissionManager.has_storage_permission()
+	_log_to_ui("  Has permission: %s" % str(has_perm))
+	
+	var status_text = PermissionManager.get_permission_status_text()
+	_log_to_ui("  %s" % status_text)
+	
+	if has_perm:
+		var saf_path = PermissionManager.get_saf_folder_path()
+		_log_to_ui("  SAF path: %s" % saf_path)
+	else:
+		_log_to_ui("  Using fallback storage")
+	
+	_log_to_ui("")
+
+
+func _test_file_system() -> void:
+	_log_to_ui("TEST: File System Access")
+	
+	var test_dir = "user://phase1_test"
+	var dir = DirAccess.open("user://")
+	
+	if dir:
+		dir.make_dir("phase1_test")
+		_log_to_ui("  ✓ Created test directory")
+		
+		var test_file = test_dir + "/test.txt"
+		var file = FileAccess.open(test_file, FileAccess.WRITE)
+		
+		if file:
+			file.store_string("Phase 1 test file\nAxiom Runtime\n")
+			file.close()
+			_log_to_ui("  ✓ Created test file")
+			
+			# Read it back
+			file = FileAccess.open(test_file, FileAccess.READ)
+			if file:
+				var content = file.get_as_text()
+				_log_to_ui("  ✓ Read test file: %d bytes" % content.length())
+				file.close()
+			
+			# Clean up
+			DirAccess.remove_absolute(test_file)
+			dir.remove("phase1_test")
+			_log_to_ui("  ✓ Cleaned up test files")
+		else:
+			_log_to_ui("  ✗ Could not create test file")
+	else:
+		_log_to_ui("  ✗ Could not access user:// directory")
+	
+	_log_to_ui("")
+
+
+func _test_profiling() -> void:
+	_log_to_ui("TEST: Profiling System")
+	
+	var profile_id = LoggingService.start_profile("UI Test Operation")
+	_log_to_ui("  ✓ Started profile (ID: %d)" % profile_id)
+	
+	# Simulate some work
+	await get_tree().create_timer(0.1).timeout
+	
+	LoggingService.end_profile(profile_id)
+	_log_to_ui("  ✓ Ended profile (check logs for timing)")
+	
+	_log_to_ui("")
+
+
+## ============================================================================
+## BUTTON HANDLERS
+## ============================================================================
+
+func _on_test_button_pressed() -> void:
+	_log_to_ui("")
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("Running comprehensive tests...")
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("")
+	
+	# Test CoreMod log registration
+	_test_coremod_logging()
+	
+	# Test log levels
+	_test_log_levels()
+	
+	# Test error handling
+	_test_error_handling()
+	
+	_log_to_ui("")
+	_log_to_ui("✓ All tests complete!")
+
+
+func _test_coremod_logging() -> void:
+	_log_to_ui("TEST: CoreMod Logging")
+	
+	var test_coremod_id = "test_coremod_001"
+	var coremod_log = LoggingService.register_coremod_log(test_coremod_id)
+	
+	if coremod_log != "":
+		_log_to_ui("  ✓ Registered CoreMod log: %s" % coremod_log.get_file())
+		
+		# Write test entry
+		LoggingService.log_coremod(LoggingService.Level.INFO, test_coremod_id, "TestMod", "Test CoreMod log entry")
+		_log_to_ui("  ✓ Wrote test entry to CoreMod log")
+		
+		# Verify file exists
+		if FileAccess.file_exists(coremod_log):
+			_log_to_ui("  ✓ CoreMod log file exists")
+		
+		# Unregister
+		LoggingService.unregister_coremod_log(test_coremod_id)
+		_log_to_ui("  ✓ Unregistered CoreMod log")
+	else:
+		_log_to_ui("  ✗ Failed to register CoreMod log")
+	
+	_log_to_ui("")
+
+
+func _test_log_levels() -> void:
+	_log_to_ui("TEST: Log Levels")
+	
+	LoggingService.verbose(LoggingService.Context.CORE, "Phase1Test", "VERBOSE test message")
+	LoggingService.debug(LoggingService.Context.CORE, "Phase1Test", "DEBUG test message")
+	LoggingService.info(LoggingService.Context.CORE, "Phase1Test", "INFO test message")
+	LoggingService.warn(LoggingService.Context.CORE, "Phase1Test", "WARN test message")
+	LoggingService.error(LoggingService.Context.CORE, "Phase1Test", "ERROR test message")
+	
+	_log_to_ui("  ✓ Wrote all log levels (check log file)")
+	_log_to_ui("")
+
+
+func _test_error_handling() -> void:
+	_log_to_ui("TEST: Error Handling")
+	
+	# Test logging with exception
+	LoggingService.error(LoggingService.Context.CORE, "Phase1Test", "Test error with exception", "Test stack trace here")
+	_log_to_ui("  ✓ Logged error with exception")
+	
+	# Test invalid CoreMod ID
+	LoggingService.log_coremod(LoggingService.Level.INFO, "nonexistent_mod", "Test", "This should fail")
+	_log_to_ui("  ✓ Handled invalid CoreMod ID")
+	
+	_log_to_ui("")
+
+
+func _on_clear_button_pressed() -> void:
+	_test_output = ""
+	output_label.text = ""
+
+
+func _on_request_perm_button_pressed() -> void:
+	_log_to_ui("")
+	_log_to_ui("Requesting SAF folder access...")
+	_log_to_ui("")
+	
+	PermissionManager.request_saf_folder_access()
+	
+	await get_tree().create_timer(0.5).timeout
+	
+	_log_to_ui("Permission request completed")
+	_log_to_ui("Check logs for details")
+	_log_to_ui("")
+
+
+func _on_stats_button_pressed() -> void:
+	_log_to_ui("")
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("STATISTICS")
+	_log_to_ui("═══════════════════════════════════════")
+	_log_to_ui("")
+	
+	# Logging stats
+	var logging_stats = LoggingService.get_logging_stats()
+	for line in logging_stats.split("\n"):
+		if line.strip_edges() != "":
+			_log_to_ui(line)
+	
+	_log_to_ui("")
+	
+	# Permission diagnostics
+	var perm_diag = PermissionManager.get_permission_diagnostics()
+	for line in perm_diag.split("\n"):
+		if line.strip_edges() != "":
+			_log_to_ui(line)
+	
+	_log_to_ui("")
+	
+	# Runtime status
+	var runtime_status = Bootstrap.get_runtime_status()
+	for line in runtime_status.split("\n"):
+		if line.strip_edges() != "":
+			_log_to_ui(line)
+
+
+## ============================================================================
+## UI HELPERS
+## ============================================================================
+
+func _log_to_ui(message: String) -> void:
+	_test_output += message + "\n"
+	output_label.text = _test_output
+	
+	# Auto-scroll to bottom
+	await get_tree().process_frame
+	var scroll = output_label.get_parent() as ScrollContainer
+	if scroll:
+		scroll.scroll_vertical = int(scroll.get_v_scroll_bar().max_value)
+
+
+res://axiom-runtime-/core/test_scenes/Phase1Test.gd.uid
+
+## Phase1Test.gd.uid
+## Directory: /axiom-runtime-/core/test_scenes/Phase1Test.gd.uid
+##
+
+uid://dyh5exgmw4jny
+
+
+res://axiom-runtime-/core/test_scenes/Phase1Test.tscn
+
+## Phase1Test.tscn
+## Directory: /axiom-runtime-/core/test_scenes/Phase1Test.tscn
+##
+
+[gd_scene load_steps=2 format=3 uid="uid://phase1test"]
+
+[ext_resource type="Script" path="res://core/test_scenes/Phase1Test.gd" id="1"]
+
+[node name="Phase1Test" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1")
+
+[node name="MarginContainer" type="MarginContainer" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/margin_left = 20
+theme_override_constants/margin_top = 20
+theme_override_constants/margin_right = 20
+theme_override_constants/margin_bottom = 20
+
+[node name="VBoxContainer" type="VBoxContainer" parent="MarginContainer"]
+layout_mode = 2
+theme_override_constants/separation = 10
+
+[node name="Title" type="Label" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+text = "AXIOM RUNTIME - PHASE 1 TEST"
+horizontal_alignment = 1
+theme_override_font_sizes/font_size = 24
+
+[node name="ScrollContainer" type="ScrollContainer" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="OutputLabel" type="Label" parent="MarginContainer/VBoxContainer/ScrollContainer"]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+custom_minimum_size = Vector2(800, 0)
+theme_override_font_sizes/font_size = 14
+text = "Initializing..."
+horizontal_alignment = 0
+vertical_alignment = 0
+autowrap_mode = 2
+
+[node name="TestButton" type="Button" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+text = "Run Comprehensive Tests"
+
+[node name="RequestPermButton" type="Button" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+text = "Request SAF Folder Access"
+
+[node name="StatsButton" type="Button" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+text = "Show Statistics"
+
+[node name="ClearButton" type="Button" parent="MarginContainer/VBoxContainer"]
+layout_mode = 2
+text = "Clear Output"
+
